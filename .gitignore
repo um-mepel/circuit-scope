@@ -3,17 +3,31 @@ node_modules/
 
 # Build outputs
 dist/
-src-tauri/target/
 
-# Tauri
+# Rust (workspace + `cargo build --manifest-path …/verilog-core`)
+**/target/
+
+# Tauri / frontend tooling
 .tauri/
+*.tsbuildinfo
 
 # IDE / OS
 .idea/
 .vscode/
 .DS_Store
+Thumbs.db
 *.log
+*.swp
+*.swo
+*~
 
 # Env
 .env
 .env.local
+.env.*.local
+
+# Test / coverage
+coverage/
+
+*.vcd
+docs/
