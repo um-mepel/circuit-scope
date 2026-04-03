@@ -1,0 +1,128 @@
+#! /opt/homebrew/Cellar/icarus-verilog/12.0/bin/vvp
+:ivl_version "12.0 (stable)";
+:ivl_delay_selection "TYPICAL";
+:vpi_time_precision - 9;
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/system.vpi";
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/vhdl_sys.vpi";
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/vhdl_textio.vpi";
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/v2005_math.vpi";
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/va_math.vpi";
+:vpi_module "/opt/homebrew/Cellar/icarus-verilog/12.0/lib/ivl/v2009.vpi";
+S_0x104de6a50 .scope package, "$unit" "$unit" 2 1;
+ .timescale 0 0;
+S_0x104de6bd0 .scope module, "MagnitudeTestbench" "MagnitudeTestbench" 3 22;
+ .timescale -9 -9;
+v0xa43028000_0 .var "A", 2 0;
+v0xa430280a0_0 .net "A_eq_B", 0 0, L_0xa43028c80;  1 drivers
+v0xa43028140_0 .net "A_gt_B", 0 0, L_0xa43028b40;  1 drivers
+v0xa430281e0_0 .net "A_lt_B", 0 0, L_0xa43028be0;  1 drivers
+v0xa43028280_0 .var "B", 2 0;
+S_0x104de4db0 .scope module, "comp" "MagnitudeComp" 3 27, 3 6 0, S_0x104de6bd0;
+ .timescale -9 -9;
+    .port_info 0 /INPUT 3 "A";
+    .port_info 1 /INPUT 3 "B";
+    .port_info 2 /OUTPUT 1 "A_gt_B";
+    .port_info 3 /OUTPUT 1 "A_lt_B";
+    .port_info 4 /OUTPUT 1 "A_eq_B";
+v0x104def330_0 .net "A", 2 0, v0xa43028000_0;  1 drivers
+v0x104deea50_0 .net "A_eq_B", 0 0, L_0xa43028c80;  alias, 1 drivers
+v0x104def640_0 .net "A_gt_B", 0 0, L_0xa43028b40;  alias, 1 drivers
+v0x104dedb00_0 .net "A_lt_B", 0 0, L_0xa43028be0;  alias, 1 drivers
+v0x104ded720_0 .net "B", 2 0, v0xa43028280_0;  1 drivers
+L_0xa43028b40 .cmp/gt 3, v0xa43028280_0, v0xa43028000_0;
+L_0xa43028be0 .cmp/gt 3, v0xa43028000_0, v0xa43028280_0;
+L_0xa43028c80 .cmp/eq 3, v0xa43028000_0, v0xa43028280_0;
+S_0x104de4c30 .scope module, "SelectorTestbench" "SelectorTestbench" 4 3;
+ .timescale -9 -9;
+v0xa430288c0_0 .net "Out_F", 6 0, L_0xa430142a0;  1 drivers
+v0xa43028960_0 .var "Set_A", 6 0;
+v0xa43028a00_0 .var "Set_B", 6 0;
+v0xa43028aa0_0 .var "sel", 0 0;
+S_0x104dea5d0 .scope module, "Sel" "Selector" 4 8, 5 3 0, S_0x104de4c30;
+ .timescale 0 0;
+    .port_info 0 /INPUT 1 "sel";
+    .port_info 1 /INPUT 7 "Set_A";
+    .port_info 2 /INPUT 7 "Set_B";
+    .port_info 3 /OUTPUT 7 "Out_F";
+L_0xa43014150 .functor AND 7, L_0x104ded340, v0xa43028960_0, C4<1111111>, C4<1111111>;
+L_0xa430141c0 .functor NOT 1, v0xa43028aa0_0, C4<0>, C4<0>, C4<0>;
+L_0xa43014230 .functor AND 7, L_0x104dea750, v0xa43028a00_0, C4<1111111>, C4<1111111>;
+L_0xa430142a0 .functor OR 7, L_0xa43014150, L_0xa43014230, C4<0000000>, C4<0000000>;
+v0xa43028320_0 .net "Out_F", 6 0, L_0xa430142a0;  alias, 1 drivers
+v0xa430283c0_0 .net "Set_A", 6 0, v0xa43028960_0;  1 drivers
+v0xa43028460_0 .net "Set_B", 6 0, v0xa43028a00_0;  1 drivers
+v0xa43028500_0 .net *"_ivl_0", 6 0, L_0x104ded340;  1 drivers
+v0xa430285a0_0 .net *"_ivl_4", 0 0, L_0xa430141c0;  1 drivers
+v0xa43028640_0 .net *"_ivl_6", 6 0, L_0x104dea750;  1 drivers
+v0xa430286e0_0 .net "n_sel_and_B", 6 0, L_0xa43014230;  1 drivers
+v0xa43028780_0 .net "sel", 0 0, v0xa43028aa0_0;  1 drivers
+v0xa43028820_0 .net "sel_and_A", 6 0, L_0xa43014150;  1 drivers
+LS_0x104ded340_0_0 .concat [ 1 1 1 1], v0xa43028aa0_0, v0xa43028aa0_0, v0xa43028aa0_0, v0xa43028aa0_0;
+LS_0x104ded340_0_4 .concat [ 1 1 1 0], v0xa43028aa0_0, v0xa43028aa0_0, v0xa43028aa0_0;
+L_0x104ded340 .concat [ 4 3 0 0], LS_0x104ded340_0_0, LS_0x104ded340_0_4;
+LS_0x104dea750_0_0 .concat [ 1 1 1 1], L_0xa430141c0, L_0xa430141c0, L_0xa430141c0, L_0xa430141c0;
+LS_0x104dea750_0_4 .concat [ 1 1 1 0], L_0xa430141c0, L_0xa430141c0, L_0xa430141c0;
+L_0x104dea750 .concat [ 4 3 0 0], LS_0x104dea750_0_0, LS_0x104dea750_0_4;
+    .scope S_0x104de6bd0;
+T_0 ;
+    %pushi/vec4 0, 0, 3;
+    %store/vec4 v0xa43028000_0, 0, 3;
+    %pushi/vec4 0, 0, 3;
+    %store/vec4 v0xa43028280_0, 0, 3;
+    %delay 5, 0;
+    %pushi/vec4 4, 0, 3;
+    %store/vec4 v0xa43028000_0, 0, 3;
+    %pushi/vec4 4, 0, 3;
+    %store/vec4 v0xa43028280_0, 0, 3;
+    %delay 5, 0;
+    %pushi/vec4 6, 0, 3;
+    %store/vec4 v0xa43028000_0, 0, 3;
+    %pushi/vec4 2, 0, 3;
+    %store/vec4 v0xa43028280_0, 0, 3;
+    %delay 5, 0;
+    %pushi/vec4 1, 0, 3;
+    %store/vec4 v0xa43028000_0, 0, 3;
+    %pushi/vec4 7, 0, 3;
+    %store/vec4 v0xa43028280_0, 0, 3;
+    %delay 5, 0;
+    %pushi/vec4 7, 0, 3;
+    %store/vec4 v0xa43028000_0, 0, 3;
+    %pushi/vec4 0, 0, 3;
+    %store/vec4 v0xa43028280_0, 0, 3;
+    %delay 5, 0;
+    %end;
+    .thread T_0;
+    .scope S_0x104de4c30;
+T_1 ;
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0xa43028aa0_0, 0, 1;
+    %pushi/vec4 0, 0, 7;
+    %store/vec4 v0xa43028960_0, 0, 7;
+    %pushi/vec4 0, 0, 7;
+    %store/vec4 v0xa43028a00_0, 0, 7;
+    %delay 5, 0;
+    %pushi/vec4 127, 0, 7;
+    %store/vec4 v0xa43028960_0, 0, 7;
+    %pushi/vec4 127, 0, 7;
+    %store/vec4 v0xa43028a00_0, 0, 7;
+    %delay 5, 0;
+    %pushi/vec4 1, 0, 1;
+    %store/vec4 v0xa43028aa0_0, 0, 1;
+    %delay 5, 0;
+    %pushi/vec4 15, 0, 7;
+    %store/vec4 v0xa43028960_0, 0, 7;
+    %pushi/vec4 112, 0, 7;
+    %store/vec4 v0xa43028a00_0, 0, 7;
+    %delay 5, 0;
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0xa43028aa0_0, 0, 1;
+    %end;
+    .thread T_1;
+# The file index is used to find the file name in the following table.
+:file_names 6;
+    "N/A";
+    "<interactive>";
+    "-";
+    "MagnitudeComp.v";
+    "Lab4TestBench.v";
+    "Lab4.v";
