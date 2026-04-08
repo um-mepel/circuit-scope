@@ -1,17 +1,17 @@
-# Dependencies
+# --- Dependencies ---
 node_modules/
 
-# Build outputs
+# --- Frontend build ---
 dist/
-
-# Rust (workspace + `cargo build --manifest-path …/verilog-core`)
-**/target/
-
-# Tauri / frontend tooling
-.tauri/
 *.tsbuildinfo
 
-# IDE / OS
+# --- Rust ---
+**/target/
+
+# --- Tauri / local tooling ---
+.tauri/
+
+# --- IDE / OS ---
 .idea/
 .vscode/
 .DS_Store
@@ -21,13 +21,26 @@ Thumbs.db
 *.swo
 *~
 
-# Env
+# --- Cursor local debug logs ---
+.cursor/debug-*.log
+
+# --- Env ---
 .env
 .env.local
 .env.*.local
 
-# Test / coverage
+# --- Test / coverage ---
 coverage/
 
+# --- Simulation / EDA junk (repo root & tool outputs) ---
+simv
+simv.daidir/
+*.daidir/
+csrc/
+ucli.key
+DVEfiles/
+*.vpd
 *.vcd
-docs/
+
+# Large reference PDFs under docs/ (optional markdown can still be tracked)
+docs/**/*.pdf

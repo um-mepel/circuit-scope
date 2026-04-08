@@ -16,6 +16,7 @@ import {
   Calculator,
   FastForward,
   Hash,
+  Maximize2,
   Rewind,
   ZoomIn,
   ZoomOut,
@@ -24,6 +25,20 @@ import { theme } from "../ui/theme";
 import { IconButton } from "./IconButton";
 import type { ToastKind } from "./ToastStack";
 
+/**
+ * Strictly increasing id for each `vcd_open`, safe for Rust `u64` over Tauri IPC.
+ * Combines wall time with a local increment so that after **hot reload** (module state resets
+ * to 0) we still exceed the backend's persisted `max_open_seq`; otherwise every open is
+ * superseded and the waveform never loads.
+ */
+let lastWaveformVcdOpenSeq = 0;
+
+function allocWaveformVcdOpenSeq(): number {
+  const t = Date.now();
+  lastWaveformVcdOpenSeq = Math.max(lastWaveformVcdOpenSeq + 1, t);
+  return lastWaveformVcdOpenSeq;
+}
+
 type VcdScopeNode = {
   name: string;
   scopes: VcdScopeNode[];
@@ -31,6 +46,8 @@ type VcdScopeNode = {
 };
 
 type VcdOpenResponse = {
+  /** Backend ignored this open (newer open or close superseded it). */
+  superseded?: boolean;
   path: string;
   timeStart: number;
   timeEnd: number;
@@ -151,6 +168,117 @@ function formatSampleTimeLabel(t: number, rulerStep: number): string {
   const r = Number(t.toFixed(Math.min(8, d)));
   if (Number.isInteger(r)) return String(r);
   return String(r).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+/** One VCD `#` step length in seconds: `factor` from `$timescale` × SI base of the unit. */
+function vcdSecondsPerTick(meta: VcdOpenResponse | null): number | null {
+  const f = meta?.timescaleFactor;
+  const unitRaw = meta?.timescaleUnit?.trim().toLowerCase() ?? "";
+  if (f == null || !Number.isFinite(f) || f <= 0 || !unitRaw) return null;
+  const unitToSec: Record<string, number> = {
+    zs: 1e-21,
+    as: 1e-18,
+    fs: 1e-15,
+    ps: 1e-12,
+    ns: 1e-9,
+    us: 1e-6,
+    μs: 1e-6,
+    "\u00b5s": 1e-6,
+    ms: 1e-3,
+    s: 1,
+  };
+  const base = unitToSec[unitRaw];
+  if (base == null || unitRaw === "unknown") return null;
+  return f * base;
+}
+
+/** Pick a single SI suffix for the visible window (same idea as VaporView / Surfer). */
+function timeDisplayScaleForSpan(spanSeconds: number): { divisor: number; suffix: string } {
+  if (!Number.isFinite(spanSeconds) || spanSeconds <= 0) {
+    return { divisor: 1e-9, suffix: "ns" };
+  }
+  let expTier = Math.floor(Math.log10(spanSeconds) / 3) * 3;
+  expTier = Math.max(-21, Math.min(3, expTier));
+  const divisor = 10 ** expTier;
+  const suffix =
+    expTier === 3
+      ? "ks"
+      : expTier === 0
+        ? "s"
+        : expTier === -3
+          ? "ms"
+          : expTier === -6
+            ? "\u00b5s"
+            : expTier === -9
+              ? "ns"
+              : expTier === -12
+                ? "ps"
+                : expTier === -15
+                  ? "fs"
+                  : expTier === -18
+                    ? "as"
+                    : "zs";
+  return { divisor, suffix };
+}
+
+function formatRulerTickLabel(
+  tick: number,
+  tickStep: number,
+  meta: VcdOpenResponse | null,
+  viewT0: number,
+  viewT1: number,
+): string {
+  const secPerTick = vcdSecondsPerTick(meta);
+  if (secPerTick == null) return formatNiceTick(tick, tickStep);
+  const lo = Math.min(viewT0, viewT1);
+  const hi = Math.max(viewT0, viewT1);
+  const spanTicks = Math.max(hi - lo, 1);
+  const spanSec = spanTicks * secPerTick;
+  const { divisor, suffix } = timeDisplayScaleForSpan(spanSec);
+  const tSec = tick * secPerTick;
+  const stepSec = tickStep * secPerTick;
+  return `${formatNiceTick(tSec / divisor, stepSec / divisor)} ${suffix}`;
+}
+
+function formatSampleTimeLabelWithMeta(
+  tick: number,
+  tickStep: number,
+  meta: VcdOpenResponse | null,
+  viewT0: number,
+  viewT1: number,
+): string {
+  const secPerTick = vcdSecondsPerTick(meta);
+  if (secPerTick == null) return formatSampleTimeLabel(tick, tickStep);
+  const lo = Math.min(viewT0, viewT1);
+  const hi = Math.max(viewT0, viewT1);
+  const spanTicks = Math.max(hi - lo, 1);
+  const spanSec = spanTicks * secPerTick;
+  const { divisor, suffix } = timeDisplayScaleForSpan(spanSec);
+  const tSec = tick * secPerTick;
+  const stepSec = tickStep * secPerTick;
+  return `${formatSampleTimeLabel(tSec / divisor, stepSec / divisor)} ${suffix}`;
+}
+
+function formatVcdTickForTooltip(
+  tick: number | null,
+  meta: VcdOpenResponse | null,
+  viewT0: number,
+  viewT1: number,
+): string {
+  if (tick == null || !Number.isFinite(tick)) return "—";
+  const secPerTick = vcdSecondsPerTick(meta);
+  if (secPerTick == null) return String(tick);
+  const lo = Math.min(viewT0, viewT1);
+  const hi = Math.max(viewT0, viewT1);
+  const spanTicks = Math.max(hi - lo, 1);
+  const spanSec = spanTicks * secPerTick;
+  const { divisor, suffix } = timeDisplayScaleForSpan(spanSec);
+  const tSec = tick * secPerTick;
+  const v = tSec / divisor;
+  const label = Number.isInteger(v)
+    ? String(v)
+    : v.toFixed(9).replace(/\.?0+$/, "").replace(/\.$/, "");
+  return `${label} ${suffix}`;
 }
 
 function timeBounds(meta: VcdOpenResponse): { tMin: number; tMax: number } {
@@ -665,6 +793,8 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
 
   const [tView0, setTView0] = useState(0);
   const [tView1, setTView1] = useState(1);
+  /** Plot area width in CSS px; drives per-column VCD resampling so the full trace matches the canvas. */
+  const [plotCssWidth, setPlotCssWidth] = useState(1024);
 
   const pointerRef = useRef({
     down: false,
@@ -693,24 +823,25 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
   /** Coalesce rapid view-window changes (trackpad zoom/pan) to one query per animation frame. */
   const queryRafRef = useRef<number | null>(null);
   const queryGenRef = useRef(0);
+  const flushQueryRef = useRef<() => void>(() => {});
+  const onToastRef = useRef(onToast);
+  onToastRef.current = onToast;
 
   useEffect(() => {
     let cancelled = false;
+    const openSeq = allocWaveformVcdOpenSeq();
     setMeta(null);
     void (async () => {
       try {
         const res = await invoke<VcdOpenResponse>("vcd_open", {
           projectRoot,
           path: vcdPath,
+          openSeq,
         });
-        if (cancelled) return;
-        setMeta(res);
-        setCollapsedScopePaths(new Set());
-        setExpandedBusKeys(new Set());
+        if (cancelled || res.superseded) {
+          return;
+        }
         const { tMin, tMax } = timeBounds(res);
-        setTView0(tMin);
-        setTView1(tMax);
-        setFocusTraceKey(null);
         const first: number[] = [];
         const walk = (n: VcdScopeNode) => {
           for (const v of n.vars) {
@@ -719,10 +850,37 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
           for (const s of n.scopes) walk(s);
         };
         for (const root of res.hierarchy) walk(root);
-        setSelected(new Set(first.map(traceKeyWhole)));
+        const selectedKeys = first.map(traceKeyWhole).sort(compareTraceKey);
+        const qIds = [...first].sort((a, b) => a - b);
+        // Refs must match the new file before the first `fireQuery`; otherwise a pending rAF can
+        // still read the previous file's time window (see stale reqT1 vs ttMax in debug logs).
+        queryStateRef.current = {
+          ...queryStateRef.current,
+          meta: res,
+          tView0: tMin,
+          tView1: tMax,
+          querySignalIds: qIds,
+          projectRoot,
+          vcdPath,
+        };
+        viewMetaRef.current = {
+          ...viewMetaRef.current,
+          meta: res,
+          tView0: tMin,
+          tView1: tMax,
+          selectedArr: selectedKeys,
+        };
+        setMeta(res);
+        setCollapsedScopePaths(new Set());
+        setExpandedBusKeys(new Set());
+        setTView0(tMin);
+        setTView1(tMax);
+        setFocusTraceKey(null);
+        setSelected(new Set(selectedKeys));
+        queueMicrotask(() => flushQueryRef.current());
       } catch (e) {
         if (!cancelled) {
-          onToast?.("error", e instanceof Error ? e.message : String(e));
+          onToastRef.current?.("error", e instanceof Error ? e.message : String(e));
         }
       }
     })();
@@ -730,7 +888,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       cancelled = true;
       void invoke("vcd_close").catch(() => {});
     };
-  }, [projectRoot, vcdPath, onToast]);
+  }, [projectRoot, vcdPath]);
 
   useEffect(() => {
     if (focusTraceKey != null && !selected.has(focusTraceKey)) {
@@ -770,13 +928,15 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     }
     const { tStart, tEnd } = queryTimeWindow(st.tView0, st.tView1, st.meta);
     try {
+      const w = Math.max(32, Math.floor(plotCssWidth));
       const res = await invoke<{ transitions: VcdTransition[] }>("vcd_query", {
         projectRoot: st.projectRoot,
         path: st.vcdPath,
         signalIds: st.querySignalIds,
         tStart,
         tEnd,
-        maxPointsPerSignal: 16384,
+        maxPointsPerSignal: Math.min(2_097_152, Math.max(w * 16, 65_536)),
+        viewportWidthPx: w,
       });
       if (gen !== queryGenRef.current) return;
       setTransitions(res.transitions);
@@ -784,7 +944,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       if (gen !== queryGenRef.current) return;
       onToast?.("error", e instanceof Error ? e.message : String(e));
     }
-  }, [onToast]);
+  }, [onToast, plotCssWidth]);
 
   const scheduleQueryRaf = useCallback(() => {
     if (queryRafRef.current != null) {
@@ -804,6 +964,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     }
     void fireQuery();
   }, [fireQuery]);
+  flushQueryRef.current = flushQuery;
 
   useEffect(() => {
     if (!meta) return;
@@ -818,7 +979,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
         queryRafRef.current = null;
       }
     };
-  }, [meta, querySignalIds, tView0, tView1, projectRoot, vcdPath, scheduleQueryRaf]);
+  }, [meta, querySignalIds, tView0, tView1, projectRoot, vcdPath, plotCssWidth, scheduleQueryRaf]);
 
   const jumpToEdge = useCallback(
     async (next: boolean, edgeKind: string) => {
@@ -867,6 +1028,27 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
     },
     [focusTraceKey, projectRoot, vcdPath, flushQuery, onToast],
   );
+
+  const fitEntireTrace = useCallback(() => {
+    const m = viewMetaRef.current.meta;
+    if (!m) return;
+    const { tMin, tMax } = timeBounds(m);
+    setTView0(tMin);
+    setTView1(tMax);
+    const st = queryStateRef.current;
+    queryStateRef.current = {
+      ...st,
+      meta: st.meta ?? m,
+      tView0: tMin,
+      tView1: tMax,
+    };
+    viewMetaRef.current = {
+      ...viewMetaRef.current,
+      tView0: tMin,
+      tView1: tMax,
+    };
+    flushQuery();
+  }, [flushQuery]);
 
   const applyZoom = useCallback((zoomFactor: number, anchorFrac: number) => {
     const m = viewMetaRef.current.meta;
@@ -997,7 +1179,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       ctx.moveTo(xs, tickTop);
       ctx.lineTo(xs, tickBottom);
       ctx.stroke();
-      const label = formatNiceTick(txTime, tickStep);
+      const label = formatRulerTickLabel(txTime, tickStep, meta, t0, t1);
       ctx.fillStyle = COL_RULER_TEXT;
       ctx.textBaseline = "bottom";
       const nearL = x < 40;
@@ -1160,7 +1342,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
       ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.textBaseline = "top";
       ctx.textAlign = "left";
-      const tag = formatSampleTimeLabel(cursorTime, tickStep);
+      const tag = formatSampleTimeLabelWithMeta(cursorTime, tickStep, meta, t0, t1);
       const tw = ctx.measureText(tag).width;
       let lx = cx + 6;
       if (lx + tw > w - 4) lx = Math.max(4, cx - tw - 6);
@@ -1460,6 +1642,9 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
           >
             <ZoomOut size={18} strokeWidth={1.75} />
           </IconButton>
+          <IconButton label="Fit entire trace (full simulation time range)" onClick={fitEntireTrace} disabled={!meta}>
+            <Maximize2 size={18} strokeWidth={1.75} />
+          </IconButton>
           <span
             style={{
               width: 1,
@@ -1514,7 +1699,8 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
             </strong>
           </span>
           <span style={{ color: theme.waveform.mutedHint, fontSize: 10 }}>
-            The time ruler at the top of the plot follows zoom and pan.
+            Waveforms are resampled to the plot width so the full range matches the pixels you see;
+            ruler uses SI time from the window. Use “fit entire trace” if the view is zoomed in.
           </span>
         </div>
       ) : null}
@@ -1608,7 +1794,7 @@ export function WaveformPanel({ projectRoot, vcdPath, onClose: _onClose, onToast
                   return (
                     <div
                       key={traceKey}
-                      title={`${name} @ ${cursorTime ?? "—"}`}
+                      title={`${name} @ ${formatVcdTickForTooltip(cursorTime, meta, tView0, tView1)}`}
                       style={{
                         height: ROW_H,
                         boxSizing: "border-box",

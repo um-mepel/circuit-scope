@@ -12,7 +12,7 @@ type Props = {
   editable: boolean;
   /** File path for remount when switching documents */
   fileKey: string;
-  /** Use Verilog highlighting for .v / .sv; plain text otherwise */
+  /** Verilog (IEEE 1364) highlighting for .v / .sv (same RTL subset); plain text otherwise */
   highlightVerilog: boolean;
   /** Editor font size in CSS px (e.g. adjusted with Cmd/Ctrl ±) */
   fontSizePx?: number;

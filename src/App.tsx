@@ -5,6 +5,7 @@ import { readTextFile, writeTextFile, readDir } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { join } from "@tauri-apps/api/path";
+import { APP_VERSION } from "./appVersion";
 import { logAction } from "./logger";
 import {
   Activity,
@@ -250,6 +251,8 @@ export default function App() {
   const [terminalInstanceId, setTerminalInstanceId] = useState(0);
   const [waveformVisible, setWaveformVisible] = useState(false);
   const [waveformPath, setWaveformPath] = useState<string | null>(null);
+  /** Bumped after each Generate VCD so WaveformPanel remounts when `vcdPath` is unchanged (same output file overwritten). */
+  const [waveformMountKey, setWaveformMountKey] = useState(0);
   const [newRootEntryType, setNewRootEntryType] = useState<"file" | "folder" | null>(null);
   const [newRootEntryName, setNewRootEntryName] = useState("");
   const [renamePath, setRenamePath] = useState<string | null>(null);
@@ -456,7 +459,7 @@ export default function App() {
         setIsDirty(false);
         void logAction("open_file_from_tree", { path });
 
-        // Verilog parser can panic on unrelated text (e.g. VCD); only parse .v / .sv.
+        // Verilog (1364) parser: only invoke on .v / .sv; can panic on unrelated text (e.g. VCD).
         if (ext === "v" || ext === "sv") {
           try {
             const result = await invoke<{
@@ -1195,6 +1198,7 @@ export default function App() {
               >
                 {projectRoot && waveformVisible && waveformPath ? (
                   <WaveformPanel
+                    key={waveformMountKey}
                     projectRoot={projectRoot}
                     vcdPath={waveformPath}
                     onToast={pushToast}
@@ -1293,8 +1297,8 @@ export default function App() {
           userSelect: "none",
         }}
       >
-        <span>Circuit Scope Verilog</span>
-        <span style={{ fontVariantNumeric: "tabular-nums" }}>{__APP_VERSION__}</span>
+        <span>Circuit Scope — Verilog</span>
+        <span style={{ fontVariantNumeric: "tabular-nums" }}>{APP_VERSION}</span>
       </footer>
       {toastStack}
       {contextMenu && (

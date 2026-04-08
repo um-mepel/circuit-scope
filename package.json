@@ -1,14 +1,15 @@
 {
   "name": "circuit-scope",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
+  "description": "Verilog (IEEE 1364) IDE: edit, simulate to VCD, waveforms — not SystemVerilog.",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri dev",
-    "gen-vcd-lab4": "node scripts/run-csverilog.mjs lab4.vcd",
+    "gen-vcd-lab4": "node scripts/run-csverilog.mjs artifacts/lab4.vcd",
     "build-csverilog": "cargo build --manifest-path src-tauri/verilog-core/Cargo.toml --bin csverilog"
   },
   "dependencies": {

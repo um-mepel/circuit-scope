@@ -1,3 +1,14 @@
+//! **`verilog-core` — IEEE 1364 Verilog first.**
+//!
+//! The language design target is **Verilog** (IEEE Std 1364): `module`, `wire` / `reg`, `assign`,
+//! `always`, `initial`, delays, and hierarchical instances. This is **not** a SystemVerilog
+//! compiler: classes, interfaces, packages, assertions, and most SV-only syntax are out of scope.
+//!
+//! A few tokens found in mixed classroom or tool output (notably `logic` as a net type) are
+//! accepted so sources are not misparsed; portable coursework should still prefer `wire` / `reg`.
+//!
+//! **`.v` and `.sv` files** are discovered as *Verilog RTL* sources—the extension is convention
+//! only; both use the same parser and subset.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -12,9 +23,10 @@ mod parser;
 mod semantic;
 
 pub use crate::ir::{
-    build_ir_for_file, build_ir_for_root, sum_initial_delay_literals_for_source_file, IrAlways,
-    IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr, IrInitial, IrInstance, IrModule, IrNet,
-    IrPortConn, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
+    build_ir_for_file, build_ir_for_root, resolve_instance_port_connections,
+    sum_initial_delay_literals_for_source_file, IrAlways, IrAssign, IrBinOp, IrCaseArm, IrEdgeKind,
+    IrExpr, IrInitial, IrInstance, IrModule, IrNet, IrPortConn, IrProject, IrSensEntry,
+    IrSensitivity, IrStmt, IrUnaryOp,
 };
 pub use crate::lexer::{Token, TokenKind};
 pub use crate::optimizer::{optimize_module, optimize_project, optimize_module_with_metrics, OptimizeMetrics};
@@ -48,7 +60,7 @@ pub fn circuit_scope_project_root_for_scan(cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// One-shot: walk `root` for `.v`/`.sv`, optimise, simulate, return VCD (uses [`build_ir_for_root`], not [`crate::list_verilog_source_paths`]).
+/// One-shot: walk `root` for Verilog sources (`.v` / `.sv`), optimise, simulate, return VCD (uses [`build_ir_for_root`], not [`crate::list_verilog_source_paths`]).
 ///
 /// The **Circuit Scope** menu and **`csverilog`** CLI use [`run_csverilog_pipeline`] instead. Both are valid; file discovery differs slightly (same skip rules).
 pub fn simulate_to_vcd(root: &Path) -> Result<String, String> {
@@ -140,7 +152,21 @@ pub fn simulate_to_vcd_with(
     generate_vcd(&project, &config)
 }
 
-fn find_top_module(project: &ir::IrProject) -> Result<String, String> {
+/// Picks a simulation top when the caller did not pass `--top`: uninstantiated modules,
+/// preferring testbench-shaped names/paths (matches **File → Generate VCD** and `simulate_to_vcd`).
+pub fn find_top_module(project: &ir::IrProject) -> Result<String, String> {
+    /// Aligned with [`list_verilog_source_paths`] `tb_path_rank` filename heuristics.
+    fn source_file_looks_like_testbench(path: &str) -> bool {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| {
+                let n = n.to_lowercase();
+                n.contains("testbench") || n.ends_with("_tb.v") || n.starts_with("tb_")
+            })
+            .unwrap_or(false)
+    }
+
     // Collect all module names that are instantiated by another module.
     let mut instantiated: std::collections::HashSet<&str> =
         std::collections::HashSet::new();
@@ -167,7 +193,10 @@ fn find_top_module(project: &ir::IrProject) -> Result<String, String> {
                 .copied()
                 .filter(|m| {
                     let n = m.name.to_lowercase();
-                    n.contains("testbench") || n.ends_with("_tb") || n.starts_with("tb_")
+                    n.contains("testbench")
+                        || n.contains("test_bench")
+                        || n.ends_with("_tb")
+                        || n.starts_with("tb_")
                 })
                 .collect();
             if tb_like.len() == 1 {
@@ -176,6 +205,29 @@ fn find_top_module(project: &ir::IrProject) -> Result<String, String> {
             if tb_like.len() > 1 {
                 tb_like.sort_by(|a, b| a.name.cmp(&b.name));
                 return Ok(tb_like.last().unwrap().name.clone());
+            }
+
+            let mut path_tb: Vec<&ir::IrModule> = tops
+                .iter()
+                .copied()
+                .filter(|m| source_file_looks_like_testbench(m.path.as_str()))
+                .collect();
+            if path_tb.len() == 1 {
+                return Ok(path_tb[0].name.clone());
+            }
+            if path_tb.len() > 1 {
+                path_tb.sort_by(|a, b| a.name.cmp(&b.name));
+                return Ok(path_tb.last().unwrap().name.clone());
+            }
+
+            // Favor the usual stimulus wrapper (initial/always generators).
+            let with_initial: Vec<&ir::IrModule> = tops
+                .iter()
+                .copied()
+                .filter(|m| !m.initial_blocks.is_empty())
+                .collect();
+            if with_initial.len() == 1 {
+                return Ok(with_initial[0].name.clone());
             }
 
             let with_inst: Vec<&ir::IrModule> = tops
@@ -351,7 +403,13 @@ where
             // repo root does not load hundreds of unrelated RTL fixtures as extra tops.
             if matches!(
                 name,
-                "target" | "node_modules" | ".git" | "dist" | "tests" | "fixtures"
+                "target"
+                    | "node_modules"
+                    | ".git"
+                    | "dist"
+                    | "tests"
+                    | "fixtures"
+                    | "artifacts"
             ) {
                 continue;
             }
@@ -363,6 +421,7 @@ where
     Ok(())
 }
 
+/// Whether `path` is treated as a Verilog source (1364 RTL; `.sv` uses the same parser).
 fn is_verilog_file(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => matches!(ext.to_lowercase().as_str(), "v" | "sv"),

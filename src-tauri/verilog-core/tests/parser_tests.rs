@@ -33,3 +33,37 @@ endmodule
     assert_eq!(m.ports[2].name, "bus");
 }
 
+#[test]
+fn ansi_port_list_repeats_direction_for_comma_separated_names() {
+    let src = r#"
+module m(
+    output [6:0] TimerMSD, TimerLSD,
+    output reg [6:0] ETL, NLTL, ELTL, WTL
+);
+endmodule
+"#;
+    let res = parse_file("m.v", src);
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    let m = &res.modules[0];
+    assert_eq!(m.ports.len(), 6);
+    for p in &m.ports {
+        assert_eq!(
+            p.direction.as_deref(),
+            Some("output"),
+            "port {} missing inherited output direction",
+            p.name
+        );
+    }
+    assert_eq!(m.ports[0].name, "TimerMSD");
+    assert_eq!(m.ports[1].name, "TimerLSD");
+    assert_eq!(m.ports[2].name, "ETL");
+    assert_eq!(m.ports[5].name, "WTL");
+    for p in &m.ports {
+        assert_eq!(
+            p.width, 7,
+            "comma-separated ports must inherit [6:0] width for {}",
+            p.name
+        );
+    }
+}
+

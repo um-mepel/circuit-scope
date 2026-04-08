@@ -1,7 +1,8 @@
 [package]
 name = "verilog_core"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
+description = "IEEE 1364 Verilog parse, optimize, and VCD simulation for Circuit Scope (not SystemVerilog)."
 
 [[bin]]
 name = "csverilog"

@@ -2,8 +2,8 @@ use crate::delay_rational::DelayRational;
 use crate::lexer::{Token, TokenKind};
 use crate::{Diagnostic, Module, ParseResult, Port, Severity, SourceFile};
 
-/// A single parsed file in concrete form. This is intentionally minimal for now:
-/// it only records modules so we can grow it later without breaking callers.
+/// Concrete syntax for a parsed Verilog (IEEE 1364) file. Intentionally minimal: records modules
+/// and body items for lowering to IR — not a full SystemVerilog front end.
 #[derive(Debug, Clone)]
 pub struct CstFile {
     pub modules: Vec<CstModule>,
@@ -25,6 +25,8 @@ pub enum CstModuleItem {
         kind: NetKind,
         width: usize,
         names: Vec<String>,
+        /// Stems for unpacked dimensions (`reg [6:0] x[0:10]` → stem `x`, scalar nets `x__0`…).
+        unpacked_stems: Vec<(String, i64, i64)>,
     },
     Assign {
         lhs: String,
@@ -42,12 +44,16 @@ pub enum CstModuleItem {
     Initial {
         body: Vec<CstStmt>,
     },
+    /// `localparam` / `parameter` assignments (`localparam a = 1, b = 2;`).
+    LocalParam {
+        assignments: Vec<(String, Expr)>,
+    },
 }
 
-/// Port connection in a module instance: `.port_name(signal_expr)`.
+/// Port connection: `.port_name(signal_expr)` or **positional** (`expr` only, mapped to child ports by order).
 #[derive(Debug, Clone)]
 pub struct PortConnection {
-    pub port_name: String,
+    pub port_name: Option<String>,
     pub expr: Expr,
 }
 
@@ -71,11 +77,23 @@ pub enum EdgeKind {
     Level,
 }
 
+/// Left-hand side of a procedural assignment (`reg`, `reg[i]`, `reg[msb:lsb]`).
+#[derive(Debug, Clone)]
+pub enum AssignTarget {
+    Whole(String),
+    BitSelect { reg: String, index: Expr },
+    PartSelect {
+        reg: String,
+        msb: Expr,
+        lsb: Expr,
+    },
+}
+
 /// Procedural statement inside an always/initial block.
 #[derive(Debug, Clone)]
 pub enum CstStmt {
-    BlockingAssign { lhs: String, rhs: Expr },
-    NonBlockingAssign { lhs: String, rhs: Expr },
+    BlockingAssign { target: AssignTarget, rhs: Expr },
+    NonBlockingAssign { target: AssignTarget, rhs: Expr },
     IfElse {
         cond: Expr,
         then_body: Vec<CstStmt>,
@@ -130,6 +148,12 @@ pub enum Expr {
         else_expr: Box<Expr>,
     },
     Concat(Vec<Expr>),
+    /// Index or part-select postfix: `base[msb]` or `base[msb:lsb]`.
+    Index {
+        base: Box<Expr>,
+        msb: Box<Expr>,
+        lsb: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -298,6 +322,9 @@ impl<'a> Parser<'a> {
         }
 
         if self.match_kind(TokenKind::LParen) {
+            // ANSI lists: `output [6:0] a, b` applies output and vector width to both ports.
+            let mut last_port_direction: Option<String> = None;
+            let mut last_port_width: usize = 1;
             loop {
                 while !matches!(
                     self.current().kind,
@@ -317,14 +344,18 @@ impl<'a> Parser<'a> {
                     break;
                 }
 
-                let mut direction = None;
-                if matches!(
+                let direction = if matches!(
                     self.current().kind,
                     TokenKind::Input | TokenKind::Output | TokenKind::Inout
                 ) {
-                    direction = Some(self.current().lexeme.clone());
+                    let d = Some(self.current().lexeme.clone());
                     self.bump();
-                }
+                    last_port_direction = d.clone();
+                    last_port_width = 1;
+                    d
+                } else {
+                    last_port_direction.clone()
+                };
 
                 let (name, width) = {
                     let start_idx = self.pos;
@@ -348,7 +379,15 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    let w = extract_range_width(&self.tokens[start_idx..end_idx]);
+                    let slice = &self.tokens[start_idx..end_idx];
+                    let w_declared = extract_range_width(slice);
+                    let has_packed_dim = slice.iter().any(|t| t.kind == TokenKind::LBracket);
+                    let w = if has_packed_dim {
+                        w_declared
+                    } else {
+                        last_port_width
+                    };
+                    last_port_width = w;
                     if let Some((next_pos, name)) = found_name {
                         self.pos = next_pos;
                         (Some(name), w)
@@ -386,6 +425,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Assign
                     | TokenKind::Wire
                     | TokenKind::Reg
+                    | TokenKind::Logic
                     | TokenKind::Module
                     | TokenKind::Endmodule
             ) {
@@ -408,6 +448,7 @@ impl<'a> Parser<'a> {
             if self.current().kind == TokenKind::Wire
                 || self.current().kind == TokenKind::Reg
                 || self.current().kind == TokenKind::Integer
+                || self.current().kind == TokenKind::Logic
             {
                 if let Some(item) = self.parse_net_decl() {
                     items.push(item);
@@ -426,7 +467,11 @@ impl<'a> Parser<'a> {
                 || self.current().kind == TokenKind::Localparam
             {
                 self.bump();
-                self.skip_to_semicolon();
+                if let Some(assigns) = self.parse_param_assign_list_after_keyword() {
+                    items.push(CstModuleItem::LocalParam { assignments: assigns });
+                } else {
+                    self.skip_to_semicolon();
+                }
             } else if self.current().kind == TokenKind::Identifier {
                 if let Some(item) = self.parse_instance_like() {
                     items.push(item);
@@ -456,10 +501,38 @@ impl<'a> Parser<'a> {
         let _ = self.match_kind(TokenKind::Semicolon);
     }
 
+    /// After consuming the `parameter` / `localparam` keyword: optional `[high:low]`, then
+    /// `name = expr` comma-lists (IEEE 1364).
+    fn parse_param_assign_list_after_keyword(&mut self) -> Option<Vec<(String, Expr)>> {
+        if self.current().kind == TokenKind::LBracket {
+            while self.current().kind != TokenKind::RBracket && self.current().kind != TokenKind::Eof {
+                self.bump();
+            }
+            let _ = self.match_kind(TokenKind::RBracket);
+        }
+        let mut pairs = Vec::new();
+        loop {
+            let name = self.expect_identifier("expected parameter name")?;
+            if !self.match_kind(TokenKind::Eq) {
+                self.error_at_current("expected `=` in parameter/localparam declaration");
+                return None;
+            }
+            let rhs = self.parse_expression(0);
+            pairs.push((name, rhs));
+            if self.match_kind(TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        let _ = self.match_kind(TokenKind::Semicolon);
+        Some(pairs)
+    }
+
     fn parse_net_decl(&mut self) -> Option<CstModuleItem> {
         let kind = match self.current().kind {
             TokenKind::Wire => NetKind::Wire,
             TokenKind::Integer => NetKind::Reg,
+            TokenKind::Logic => NetKind::Reg,
             _ => NetKind::Reg,
         };
         self.bump();
@@ -483,11 +556,41 @@ impl<'a> Parser<'a> {
         }
 
         let mut names = Vec::new();
+        let mut unpacked_stems: Vec<(String, i64, i64)> = Vec::new();
         loop {
-            if let Some(name) = self.expect_identifier("expected signal name") {
-                names.push(name);
+            let stem = match self.expect_identifier("expected signal name") {
+                Some(n) => n,
+                None => break,
+            };
+            if self.current().kind == TokenKind::LBracket {
+                self.bump();
+                let hi = match self.parse_dim_literal() {
+                    Some(v) => v,
+                    None => {
+                        self.skip_to_semicolon();
+                        return None;
+                    }
+                };
+                let lo = if self.match_kind(TokenKind::Colon) {
+                    match self.parse_dim_literal() {
+                        Some(v) => v,
+                        None => {
+                            self.skip_to_semicolon();
+                            return None;
+                        }
+                    }
+                } else {
+                    hi
+                };
+                let _ = self.match_kind(TokenKind::RBracket);
+                let low = hi.min(lo);
+                let high = hi.max(lo);
+                for i in low..=high {
+                    names.push(format!("{}__{}", stem, i));
+                }
+                unpacked_stems.push((stem, low, high));
             } else {
-                break;
+                names.push(stem);
             }
             if !self.match_kind(TokenKind::Comma) {
                 break;
@@ -497,7 +600,23 @@ impl<'a> Parser<'a> {
         if names.is_empty() {
             None
         } else {
-            Some(CstModuleItem::NetDecl { kind, width, names })
+            Some(CstModuleItem::NetDecl {
+                kind,
+                width,
+                names,
+                unpacked_stems,
+            })
+        }
+    }
+
+    fn parse_dim_literal(&mut self) -> Option<i64> {
+        if self.current().kind == TokenKind::Number {
+            let v = self.current().lexeme.parse::<i64>().ok()?;
+            self.bump();
+            Some(v)
+        } else {
+            self.error_at_current("expected numeric dimension in []");
+            None
         }
     }
 
@@ -547,11 +666,17 @@ impl<'a> Parser<'a> {
                         let _ = self.match_kind(TokenKind::LParen);
                         let expr = self.parse_expression(0);
                         let _ = self.match_kind(TokenKind::RParen);
-                        connections.push(PortConnection { port_name, expr });
+                        connections.push(PortConnection {
+                            port_name: Some(port_name),
+                            expr,
+                        });
                     }
                 } else {
-                    // Positional connection — skip
-                    self.bump();
+                    let expr = self.parse_expression(0);
+                    connections.push(PortConnection {
+                        port_name: None,
+                        expr,
+                    });
                 }
                 if !self.match_kind(TokenKind::Comma) {
                     break;
@@ -688,6 +813,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// After the register/net identifier: optional `[bit]` or `[msb:lsb]`.
+    fn parse_assign_target_suffix(&mut self, reg: String) -> AssignTarget {
+        if self.current().kind == TokenKind::LBracket {
+            self.bump();
+            let msb = self.parse_expression(0);
+            if self.match_kind(TokenKind::Colon) {
+                let lsb = self.parse_expression(0);
+                let _ = self.match_kind(TokenKind::RBracket);
+                AssignTarget::PartSelect { reg, msb, lsb }
+            } else {
+                let _ = self.match_kind(TokenKind::RBracket);
+                AssignTarget::BitSelect { reg, index: msb }
+            }
+        } else {
+            AssignTarget::Whole(reg)
+        }
+    }
+
     fn parse_stmt(&mut self) -> Option<CstStmt> {
         match self.current().kind {
             TokenKind::Hash => {
@@ -773,19 +916,20 @@ impl<'a> Parser<'a> {
                 Some(CstStmt::For { init_var, init_val, cond, step_var, step_expr, body })
             }
             TokenKind::Identifier => {
-                let lhs = self.current().lexeme.clone();
+                let reg = self.current().lexeme.clone();
                 self.bump();
+                let target = self.parse_assign_target_suffix(reg);
                 if self.current().kind == TokenKind::Le {
                     // Non-blocking assignment: lhs <= rhs
                     self.bump();
                     let rhs = self.parse_expression(0);
                     let _ = self.match_kind(TokenKind::Semicolon);
-                    Some(CstStmt::NonBlockingAssign { lhs, rhs })
+                    Some(CstStmt::NonBlockingAssign { target, rhs })
                 } else if self.match_kind(TokenKind::Eq) {
                     // Blocking assignment: lhs = rhs
                     let rhs = self.parse_expression(0);
                     let _ = self.match_kind(TokenKind::Semicolon);
-                    Some(CstStmt::BlockingAssign { lhs, rhs })
+                    Some(CstStmt::BlockingAssign { target, rhs })
                 } else {
                     self.skip_to_semicolon();
                     None
@@ -887,7 +1031,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Expr {
-        match self.current().kind {
+        let expr = match self.current().kind {
             TokenKind::Identifier => {
                 let name = self.current().lexeme.clone();
                 self.bump();
@@ -937,7 +1081,27 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Ident("<unsupported>".to_string())
             }
+        };
+        self.parse_index_suffixes(expr)
+    }
+
+    fn parse_index_suffixes(&mut self, mut expr: Expr) -> Expr {
+        while self.current().kind == TokenKind::LBracket {
+            self.bump();
+            let msb = self.parse_expression(0);
+            let lsb = if self.match_kind(TokenKind::Colon) {
+                Some(Box::new(self.parse_expression(0)))
+            } else {
+                None
+            };
+            let _ = self.match_kind(TokenKind::RBracket);
+            expr = Expr::Index {
+                base: Box::new(expr),
+                msb: Box::new(msb),
+                lsb,
+            };
         }
+        expr
     }
 }
 

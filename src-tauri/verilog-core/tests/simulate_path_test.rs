@@ -1,5 +1,5 @@
 //! **File → Generate VCD** and **`csverilog &lt;out&gt;`** use `list_verilog_source_paths` + [`run_csverilog_pipeline`].
-//! This test locks that behavior for the repo layout (Lab4 + MagnitudeComp, etc.).
+//! This test locks that behavior when Lab4 sources exist (`samples/lab4/` or repo root).
 use std::path::PathBuf;
 
 use verilog_core::{list_verilog_source_paths, run_csverilog_pipeline};
@@ -7,8 +7,10 @@ use verilog_core::{list_verilog_source_paths, run_csverilog_pipeline};
 #[test]
 fn repo_scan_pipeline_emits_seven_bit_lab4_vcd() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if !repo.join("Lab4TestBench.v").is_file() {
-        eprintln!("skip: Lab4 fixtures not at repo root");
+    let has_lab4_tb = repo.join("samples/lab4/Lab4TestBench.v").is_file()
+        || repo.join("Lab4TestBench.v").is_file();
+    if !has_lab4_tb {
+        eprintln!("skip: Lab4TestBench.v not in samples/lab4/ or repo root");
         return;
     }
 

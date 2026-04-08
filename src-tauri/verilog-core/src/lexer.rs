@@ -15,6 +15,8 @@ pub enum TokenKind {
     Localparam,
     Wire,
     Reg,
+    /// Non-1364 `logic` keyword — accepted only so declarations are not misparsed as instances. Prefer `wire`/`reg` in portable Verilog.
+    Logic,
     Assign,
     // sequential / procedural keywords
     Always,
@@ -172,6 +174,7 @@ impl<'a> Lexer<'a> {
                     "localparam" => TokenKind::Localparam,
                     "wire" => TokenKind::Wire,
                     "reg" => TokenKind::Reg,
+                    "logic" => TokenKind::Logic,
                     "assign" => TokenKind::Assign,
                     "always" => TokenKind::Always,
                     "initial" => TokenKind::Initial,
@@ -361,5 +364,18 @@ impl<'a> Lexer<'a> {
             offset: self.src.len(),
         });
         tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SourceFile;
+
+    #[test]
+    fn logic_is_keyword() {
+        let f = SourceFile::new("x.v", "logic");
+        let t = lex(&f);
+        assert_eq!(t[0].kind, TokenKind::Logic, "lexeme={}", t[0].lexeme);
     }
 }

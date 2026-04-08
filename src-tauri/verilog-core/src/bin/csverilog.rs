@@ -13,8 +13,9 @@ fn main() {
         eprintln!("Usage: csverilog [options] <output> [--explicit <file.v> ...]");
         eprintln!();
         eprintln!("  output       VCD base name or path (.vcd added if missing). Example: lab4 → lab4.vcd");
-        eprintln!("  (default)    All .v/.sv under the opened project folder in Circuit Scope (env {CIRCUIT_SCOPE_PROJECT_ROOT_VAR}),");
-        eprintln!("               else under the current directory — same discovery as File → Generate VCD.");
+        eprintln!("  (default)    All Verilog RTL files (.v / .sv = same IEEE-1364 subset) under the project");
+        eprintln!("               folder in Circuit Scope (env {CIRCUIT_SCOPE_PROJECT_ROOT_VAR}), else cwd —");
+        eprintln!("               same discovery as File → Generate VCD.");
         eprintln!("               Relative output paths use that project folder too, even after `cd` in the app.");
         eprintln!("               Extra words (e.g. *.v) are ignored.");
         eprintln!("  --explicit   Use only the listed files, in order (for scripts/tests).");

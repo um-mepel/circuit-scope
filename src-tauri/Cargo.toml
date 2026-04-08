@@ -1,7 +1,8 @@
 [package]
 name = "circuit_scope"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
+description = "Circuit Scope — Verilog (IEEE 1364) editor, simulator, and VCD viewer."
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

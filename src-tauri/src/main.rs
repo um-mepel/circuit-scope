@@ -102,7 +102,7 @@ fn compiler_info() -> CompilerInfo {
     }
 }
 
-/// **File → Generate VCD** — same IR/simulation path as the `csverilog` CLI (`run_csverilog_pipeline`), in-process (no `cargo` subprocess).
+/// **File → Generate VCD** — IEEE 1364 Verilog → VCD via the same path as `csverilog` (`run_csverilog_pipeline`), in-process.
 #[tauri::command]
 fn simulate_vcd(
     root: String,
@@ -117,7 +117,7 @@ fn simulate_vcd(
 
     let verilog_paths = verilog_core::list_verilog_source_paths(root_path).map_err(|e| e.to_string())?;
     if verilog_paths.is_empty() {
-        return Err("No .v or .sv files found under this folder.".into());
+        return Err("No Verilog sources (.v or .sv) found under this folder.".into());
     }
 
     let out_path = root_path.join(&name);
@@ -277,6 +277,16 @@ pub fn main() {
                 .text("generate_vcd", "Generate VCD in Project Folder")
                 .build()?;
 
+            // Standard Edit actions wire OS clipboard shortcuts (Cmd+C/V/X, Ctrl+C/V/X) into WKWebView
+            // on macOS; without this menu, copy/paste keyboard commands often do nothing.
+            let edit_submenu = SubmenuBuilder::new(&handle, "Edit")
+                .cut()
+                .copy()
+                .paste()
+                .separator()
+                .select_all()
+                .build()?;
+
             let terminal_submenu = SubmenuBuilder::new(&handle, "Terminal")
                 .text("open_new_terminal", "Open New Terminal")
                 .text("close_terminal", "Close Terminal")
@@ -287,6 +297,7 @@ pub fn main() {
             let menu = Menu::new(&handle)?;
             menu.append(&app_submenu)?;
             menu.append(&file_submenu)?;
+            menu.append(&edit_submenu)?;
             menu.append(&view_submenu)?;
             menu.append(&terminal_submenu)?;
             let _ = app.set_menu(menu);

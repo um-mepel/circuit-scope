@@ -108,6 +108,7 @@ fn build_semantic_module(cst: CstModule) -> SemanticModule {
             }
             CstModuleItem::Always { .. } => {}
             CstModuleItem::Initial { .. } => {}
+            CstModuleItem::LocalParam { .. } => {}
         }
     }
 

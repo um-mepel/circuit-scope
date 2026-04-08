@@ -9,14 +9,24 @@ use wellen::{
     Hierarchy, LoadOptions, ScopeOrVarRef, ScopeRef, SignalRef, SignalSource, Time, TimescaleUnit,
 };
 
+/// Mutable VCD backend state: active session plus generation for stale `vcd_open` suppression.
+pub(crate) struct VcdHolderInner {
+    session: Option<VcdSession>,
+    /// Highest `open_seq` seen from the UI; older completions must not replace the session.
+    max_open_seq: u64,
+}
+
 pub struct VcdSessionHolder {
-    pub inner: Mutex<Option<VcdSession>>,
+    pub inner: Mutex<VcdHolderInner>,
 }
 
 impl Default for VcdSessionHolder {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(VcdHolderInner {
+                session: None,
+                max_open_seq: 0,
+            }),
         }
     }
 }
@@ -93,6 +103,9 @@ pub struct VcdScopeNode {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcdOpenResponse {
+    /// When true, the UI must ignore this body (superseded by a newer open or close).
+    #[serde(default)]
+    pub superseded: bool,
     pub path: String,
     pub time_start: u64,
     pub time_end: u64,
@@ -277,7 +290,13 @@ pub fn vcd_open(
     holder: tauri::State<'_, VcdSessionHolder>,
     project_root: String,
     path: String,
+    open_seq: u64,
 ) -> Result<VcdOpenResponse, String> {
+    {
+        let mut g = holder.inner.lock().map_err(|e| e.to_string())?;
+        g.max_open_seq = g.max_open_seq.max(open_seq);
+    }
+
     let fp = path_under_project(&project_root, &path)?;
     let opts = LoadOptions {
         multi_thread: false,
@@ -308,9 +327,22 @@ pub fn vcd_open(
         time_table: body.time_table,
         source: body.source,
     };
-    *holder.inner.lock().map_err(|e| e.to_string())? = Some(session);
+    let mut g = holder.inner.lock().map_err(|e| e.to_string())?;
+    if open_seq < g.max_open_seq {
+        return Ok(VcdOpenResponse {
+            superseded: true,
+            path: path_str,
+            time_start,
+            time_end,
+            timescale_factor,
+            timescale_unit,
+            hierarchy: tree,
+        });
+    }
+    g.session = Some(session);
 
     Ok(VcdOpenResponse {
+        superseded: false,
         path: path_str,
         time_start,
         time_end,
@@ -334,6 +366,8 @@ pub struct VcdQueryResponse {
     pub transitions: Vec<VcdTransition>,
 }
 
+/// Query trace samples; with `viewport_width_px`, resamples at plot column edges so overview traces
+/// match the canvas (same idea as professional viewers).
 #[tauri::command]
 pub fn vcd_query(
     holder: tauri::State<'_, VcdSessionHolder>,
@@ -343,19 +377,22 @@ pub fn vcd_query(
     t_start: u64,
     t_end: u64,
     max_points_per_signal: Option<usize>,
+    // CSS pixels of plot width: subsample at column boundaries to match drawn pixels.
+    viewport_width_px: Option<u32>,
 ) -> Result<VcdQueryResponse, String> {
     let fp = path_under_project(&project_root, &path)?;
     let path_str = fp.to_string_lossy().to_string();
 
     let mut guard = holder.inner.lock().map_err(|e| e.to_string())?;
     let session = guard
+        .session
         .as_mut()
         .ok_or_else(|| "No VCD loaded; open a waveform first".to_string())?;
     if session.path != path_str || session.project_root != project_root {
         return Err("VCD session path mismatch; reload waveform".to_string());
     }
 
-    let max_pts = max_points_per_signal.unwrap_or(2048).max(32);
+    let max_pts = max_points_per_signal.unwrap_or(65_536).max(32);
 
     let tt_min = session.time_table.first().copied().unwrap_or(0);
     let tt_max = session.time_table.last().copied().unwrap_or(tt_min);
@@ -435,9 +472,19 @@ pub fn vcd_query(
                 );
             }
         }
-        transitions.extend(decimate_transitions_slice(
-            &local, max_pts, t_start, t_end, sid,
-        ));
+        if local.is_empty() {
+            continue;
+        }
+        let decimated = match viewport_width_px.filter(|&w| w > 0) {
+            Some(pw) => {
+                let cap = max_pts.max(32).min(1_048_576);
+                let ncols = (pw as usize).clamp(32, cap);
+                resample_transitions_for_viewport(&local, t_start, t_end, ncols, sid)
+            }
+            None if local.len() <= max_pts => local,
+            None => decimate_transitions_slice(&local, max_pts, t_start, t_end, sid),
+        };
+        transitions.extend(decimated);
     }
 
     transitions.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.signal_id.cmp(&b.signal_id)));
@@ -455,6 +502,55 @@ fn value_at_or_before(times: &[VcdTransition], t: u64) -> Option<&str> {
     } else {
         Some(times[idx - 1].value.as_str())
     }
+}
+
+/// Hold-value resample at **plot column** right edges (`ncols` ≈ CSS plot width): same net effect as
+/// sampling once per pixel column, so zoomed-out views show the true envelope instead of a random
+/// beat-frequency pattern from a fixed N-sample grid.
+fn resample_transitions_for_viewport(
+    rows: &[VcdTransition],
+    t_start: u64,
+    t_end: u64,
+    ncols: usize,
+    sid: u32,
+) -> Vec<VcdTransition> {
+    if rows.is_empty() {
+        return vec![];
+    }
+    let ncols = ncols.max(2);
+    let span_u = t_end.saturating_sub(t_start);
+    let span_u = span_u.max(1);
+
+    let v_start = value_at_or_before(rows, t_start)
+        .unwrap_or_else(|| rows[0].value.as_str())
+        .to_string();
+    let mut out: Vec<VcdTransition> = Vec::with_capacity(ncols.min(4096));
+    out.push(VcdTransition {
+        signal_id: sid,
+        time: t_start,
+        value: v_start.clone(),
+    });
+    let mut last_v = v_start;
+
+    for j in 0..ncols {
+        let t_edge = if j + 1 == ncols {
+            t_end
+        } else {
+            t_start.saturating_add(span_u.saturating_mul((j + 1) as u64) / (ncols as u64))
+        };
+        let v = value_at_or_before(rows, t_edge)
+            .unwrap_or(last_v.as_str())
+            .to_string();
+        if v != last_v {
+            out.push(VcdTransition {
+                signal_id: sid,
+                time: t_edge,
+                value: v.clone(),
+            });
+            last_v = v;
+        }
+    }
+    out
 }
 
 /// Subsample along **time** (not change-index) so step waveforms stay coherent when zoomed out.
@@ -525,6 +621,7 @@ pub fn vcd_find_edge(
 
     let mut guard = holder.inner.lock().map_err(|e| e.to_string())?;
     let session = guard
+        .session
         .as_mut()
         .ok_or_else(|| "No VCD loaded; open a waveform first".to_string())?;
     if session.path != path_str || session.project_root != project_root {
@@ -596,6 +693,8 @@ pub fn vcd_find_edge(
 
 #[tauri::command]
 pub fn vcd_close(holder: tauri::State<'_, VcdSessionHolder>) -> Result<(), String> {
-    *holder.inner.lock().map_err(|e| e.to_string())? = None;
+    let mut g = holder.inner.lock().map_err(|e| e.to_string())?;
+    g.session = None;
+    g.max_open_seq = g.max_open_seq.wrapping_add(1);
     Ok(())
 }

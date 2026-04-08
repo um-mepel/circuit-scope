@@ -2,8 +2,8 @@
 // Code generator: IR → VCD
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Implements a simple event-driven simulator over the optimised IR and
-// writes value changes in IEEE 1364 VCD format. The simulator supports:
+// Language: **IEEE 1364 Verilog** IR (not SystemVerilog). Implements a simple event-driven
+// simulator over the optimised IR and writes value changes in IEEE 1364 VCD format. Supports:
 //   • Combinational logic  (continuous assign)
 //   • Sequential logic     (always @(posedge/negedge …) blocks)
 //   • Initial blocks       (with #delay scheduling)
@@ -17,7 +17,7 @@
 // viewers (GTKWave, Surfer, VaporView / wellen, etc.): multiline $timescale
 // like common simulators, portable $date, $enddefinitions before #0/$dumpvars.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 
 use crate::delay_rational::DelayRational;
@@ -58,7 +58,7 @@ fn normalize_vcd_timescale_line(ts: &str) -> String {
 pub struct VcdRunMeta {
     /// Source file where the top module was defined (absolute or as passed to the compiler).
     pub top_source_file: Option<String>,
-    /// Other `.v` / `.sv` inputs (e.g. lower-level RTL), in CLI order when applicable.
+    /// Other Verilog RTL inputs (`.v` / `.sv`), in CLI order when applicable.
     pub additional_source_files: Vec<String>,
     /// Full command line or synthetic invocation string used to produce this run.
     pub command_line: Option<String>,
@@ -174,6 +174,27 @@ struct AlwaysDelayProc {
     stmts: Vec<IrStmt>,
 }
 
+/// Bit width for a scalar `assign` LHS, including unpacked memory elements `stem__index`.
+fn width_for_assign_lhs(
+    lhs: &str,
+    widths: &HashMap<String, usize>,
+    mem_bounds: &HashMap<String, (i64, i64)>,
+    mem_elem_width: &HashMap<String, usize>,
+) -> usize {
+    if let Some(w) = widths.get(lhs) {
+        return *w;
+    }
+    for (stem, _) in mem_bounds {
+        let p = format!("{}__", stem);
+        if let Some(rest) = lhs.strip_prefix(&p) {
+            if rest.parse::<i64>().is_ok() {
+                return mem_elem_width.get(stem).copied().unwrap_or(1);
+            }
+        }
+    }
+    1
+}
+
 // ── Simulator ───────────────────────────────────────────────────────
 
 struct Simulator<'a> {
@@ -189,7 +210,11 @@ struct Simulator<'a> {
     /// Latest time in any `initial` (femtoseconds).
     initial_time_horizon_fs: u128,
     /// Signals that have been explicitly driven (not still at x).
-    driven: std::collections::HashSet<String>,
+    driven: HashSet<String>,
+    /// Inclusive bounds for [`IrExpr::MemRead`] stems (after hierarchical prefix).
+    mem_bounds: HashMap<String, (i64, i64)>,
+    /// Element width for each mem stem (packed width of `stem__k`).
+    mem_elem_width: HashMap<String, usize>,
     scope_tree: ScopeNode,
     top: &'a IrModule,
 }
@@ -198,6 +223,8 @@ impl<'a> Simulator<'a> {
     fn new(top: &'a IrModule, module_map: &HashMap<&str, &IrModule>, unit_fs: u128) -> Self {
         let mut signals: HashMap<String, i64> = HashMap::new();
         let mut widths: HashMap<String, usize> = HashMap::new();
+        let mut mem_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut mem_elem_width: HashMap<String, usize> = HashMap::new();
         let mut assigns = Vec::new();
         let mut always_blocks = Vec::new();
         let mut initial_blocks = Vec::new();
@@ -214,6 +241,8 @@ impl<'a> Simulator<'a> {
             module_map,
             &mut signals,
             &mut widths,
+            &mut mem_bounds,
+            &mut mem_elem_width,
             &mut assigns,
             &mut always_blocks,
             &mut initial_blocks,
@@ -225,8 +254,14 @@ impl<'a> Simulator<'a> {
             Self::split_always_delay_processes(always_blocks, unit_fs);
 
         // Pre-compute initial block events (times in femtoseconds).
-        let (initial_events, initial_time_horizon_fs) =
-            Self::schedule_initial_blocks(&initial_blocks, &signals, unit_fs);
+        let (initial_events, initial_time_horizon_fs) = Self::schedule_initial_blocks(
+            &initial_blocks,
+            &signals,
+            &widths,
+            &mem_bounds,
+            &mem_elem_width,
+            unit_fs,
+        );
 
         let mut vcd_ids = HashMap::new();
         for (i, name) in signal_order.iter().enumerate() {
@@ -246,10 +281,16 @@ impl<'a> Simulator<'a> {
             always_delay_procs,
             initial_events,
             initial_time_horizon_fs,
-            driven: std::collections::HashSet::new(),
+            driven: HashSet::new(),
+            mem_bounds,
+            mem_elem_width,
             scope_tree,
             top,
         }
+    }
+
+    fn width_for_signal(&self, name: &str) -> usize {
+        width_for_assign_lhs(name, &self.widths, &self.mem_bounds, &self.mem_elem_width)
     }
 
     /// `always #D ...` with non-empty tail → repeating scheduled process (clock generators).
@@ -282,6 +323,9 @@ impl<'a> Simulator<'a> {
     fn schedule_initial_blocks(
         blocks: &[IrInitial],
         signals: &HashMap<String, i64>,
+        widths: &HashMap<String, usize>,
+        mem_bounds: &HashMap<String, (i64, i64)>,
+        mem_elem_width: &HashMap<String, usize>,
         unit_fs: u128,
     ) -> (Vec<InitialEvent>, u128) {
         let mut events = Vec::new();
@@ -290,7 +334,16 @@ impl<'a> Simulator<'a> {
             let start = events.len();
             let mut t = DelayRational::ZERO;
             let mut sig = signals.clone();
-            Self::walk_initial_stmts(&ib.stmts, &mut t, &mut sig, &mut events, unit_fs);
+            Self::walk_initial_stmts(
+                &ib.stmts,
+                &mut t,
+                &mut sig,
+                widths,
+                mem_bounds,
+                mem_elem_width,
+                &mut events,
+                unit_fs,
+            );
             let mut block_max = t.to_femtoseconds(unit_fs);
             for e in &events[start..] {
                 block_max = block_max.max(e.time_fs);
@@ -305,6 +358,9 @@ impl<'a> Simulator<'a> {
         stmts: &[IrStmt],
         time: &mut DelayRational,
         signals: &mut HashMap<String, i64>,
+        widths: &HashMap<String, usize>,
+        mem_bounds: &HashMap<String, (i64, i64)>,
+        mem_elem_width: &HashMap<String, usize>,
         events: &mut Vec<InitialEvent>,
         unit_fs: u128,
     ) {
@@ -313,37 +369,108 @@ impl<'a> Simulator<'a> {
                 IrStmt::Delay(d) => {
                     *time = time.add(*d);
                 }
-                IrStmt::BlockingAssign { lhs, rhs } | IrStmt::NonBlockingAssign { lhs, rhs } => {
-                    let val = Self::static_eval(rhs, signals);
+                IrStmt::BlockingAssign { lhs, rhs } => {
+                    let val = Self::static_eval(rhs, signals, mem_bounds);
+                    let w = width_for_assign_lhs(lhs, widths, mem_bounds, mem_elem_width);
+                    let masked = mask_to_width(val, w);
                     events.push(InitialEvent {
                         time_fs: time.to_femtoseconds(unit_fs),
                         lhs: lhs.clone(),
-                        val,
+                        val: masked,
+                    });
+                    signals.insert(lhs.clone(), masked);
+                }
+                IrStmt::NonBlockingAssign { lhs, rhs } => {
+                    let val = Self::static_eval(rhs, signals, mem_bounds);
+                    let w = width_for_assign_lhs(lhs, widths, mem_bounds, mem_elem_width);
+                    let masked = mask_to_width(val, w);
+                    events.push(InitialEvent {
+                        time_fs: time.to_femtoseconds(unit_fs),
+                        lhs: lhs.clone(),
+                        val: masked,
                     });
                 }
+                IrStmt::MemAssign {
+                    stem,
+                    index,
+                    rhs,
+                    nonblocking,
+                } => {
+                    let idx = Self::static_eval(index, signals, mem_bounds);
+                    let (lo, hi) = mem_bounds.get(stem).copied().unwrap_or((0, 0));
+                    let k = idx.clamp(lo, hi);
+                    let lhs = format!("{}__{}", stem, k);
+                    let val = Self::static_eval(rhs, signals, mem_bounds);
+                    let w = width_for_assign_lhs(&lhs, widths, mem_bounds, mem_elem_width);
+                    let masked = mask_to_width(val, w);
+                    events.push(InitialEvent {
+                        time_fs: time.to_femtoseconds(unit_fs),
+                        lhs: lhs.clone(),
+                        val: masked,
+                    });
+                    if !*nonblocking {
+                        signals.insert(lhs, masked);
+                    }
+                }
                 IrStmt::IfElse { cond, then_body, else_body } => {
-                    let c = Self::static_eval(cond, signals);
+                    let c = Self::static_eval(cond, signals, mem_bounds);
                     if c != 0 {
-                        Self::walk_initial_stmts(then_body, time, signals, events, unit_fs);
+                        Self::walk_initial_stmts(
+                            then_body,
+                            time,
+                            signals,
+                            widths,
+                            mem_bounds,
+                            mem_elem_width,
+                            events,
+                            unit_fs,
+                        );
                     } else {
-                        Self::walk_initial_stmts(else_body, time, signals, events, unit_fs);
+                        Self::walk_initial_stmts(
+                            else_body,
+                            time,
+                            signals,
+                            widths,
+                            mem_bounds,
+                            mem_elem_width,
+                            events,
+                            unit_fs,
+                        );
                     }
                 }
                 IrStmt::Case {
                     expr, arms, default, ..
                 } => {
-                    let val = Self::static_eval(expr, signals);
+                    let val = Self::static_eval(expr, signals, mem_bounds);
                     let mut matched = false;
                     for arm in arms {
-                        let av = Self::static_eval(&arm.value, signals);
+                        let av = Self::static_eval(&arm.value, signals, mem_bounds);
                         if val == av {
-                            Self::walk_initial_stmts(&arm.body, time, signals, events, unit_fs);
+                            Self::walk_initial_stmts(
+                                &arm.body,
+                                time,
+                                signals,
+                                widths,
+                                mem_bounds,
+                                mem_elem_width,
+                                events,
+                                unit_fs,
+                            );
                             matched = true;
                             break;
                         }
                     }
                     if !matched {
-                        Self::walk_initial_stmts(default, time, signals, events, unit_fs);
+                        Self::walk_initial_stmts(
+                            default,
+                            time,
+                            signals,
+                            widths,
+                            mem_bounds,
+                            mem_elem_width,
+                            events,
+                            unit_fs,
+                        );
                     }
                 }
                 IrStmt::For {
@@ -354,16 +481,25 @@ impl<'a> Simulator<'a> {
                     step_expr,
                     body,
                 } => {
-                    let start = Self::static_eval(init_val, signals);
+                    let start = Self::static_eval(init_val, signals, mem_bounds);
                     signals.insert(init_var.clone(), start);
                     const MAX_INIT_FOR: usize = 10_000_000;
                     for _ in 0..MAX_INIT_FOR {
-                        let c = Self::static_eval(cond, signals);
+                        let c = Self::static_eval(cond, signals, mem_bounds);
                         if c == 0 {
                             break;
                         }
-                        Self::walk_initial_stmts(body, time, signals, events, unit_fs);
-                        let next = Self::static_eval(step_expr, signals);
+                        Self::walk_initial_stmts(
+                            body,
+                            time,
+                            signals,
+                            widths,
+                            mem_bounds,
+                            mem_elem_width,
+                            events,
+                            unit_fs,
+                        );
+                        let next = Self::static_eval(step_expr, signals, mem_bounds);
                         signals.insert(step_var.clone(), next);
                     }
                 }
@@ -372,34 +508,76 @@ impl<'a> Simulator<'a> {
         }
     }
 
-    fn static_eval(expr: &IrExpr, signals: &HashMap<String, i64>) -> i64 {
+    fn static_eval(
+        expr: &IrExpr,
+        signals: &HashMap<String, i64>,
+        mem_bounds: &HashMap<String, (i64, i64)>,
+    ) -> i64 {
         match expr {
             IrExpr::Const(v) => *v,
             IrExpr::Ident(name) => *signals.get(name).unwrap_or(&0),
             IrExpr::Binary { op, left, right } => {
-                let l = Self::static_eval(left, signals);
-                let r = Self::static_eval(right, signals);
+                let l = Self::static_eval(left, signals, mem_bounds);
+                let r = Self::static_eval(right, signals, mem_bounds);
                 eval_binop(*op, l, r)
             }
             IrExpr::Unary { op, operand } => {
-                let v = Self::static_eval(operand, signals);
+                let v = Self::static_eval(operand, signals, mem_bounds);
                 eval_unop(*op, v)
             }
             IrExpr::Ternary { cond, then_expr, else_expr } => {
-                if Self::static_eval(cond, signals) != 0 {
-                    Self::static_eval(then_expr, signals)
+                if Self::static_eval(cond, signals, mem_bounds) != 0 {
+                    Self::static_eval(then_expr, signals, mem_bounds)
                 } else {
-                    Self::static_eval(else_expr, signals)
+                    Self::static_eval(else_expr, signals, mem_bounds)
                 }
             }
             IrExpr::Concat(exprs) => {
                 let mut result: i64 = 0;
                 for (i, e) in exprs.iter().rev().enumerate() {
-                    let v = Self::static_eval(e, signals) & 1;
+                    let v = Self::static_eval(e, signals, mem_bounds) & 1;
                     result |= v << i;
                 }
                 result
             }
+            IrExpr::PartSelect { value, msb, lsb } => {
+                let v = Self::static_eval(value, signals, mem_bounds);
+                let hi = Self::static_eval(msb, signals, mem_bounds);
+                let lo = Self::static_eval(lsb, signals, mem_bounds);
+                part_select_bits(v, hi, lo)
+            }
+            IrExpr::MemRead { stem, index } => {
+                let idx = Self::static_eval(index, signals, mem_bounds);
+                let (lo, hi) = mem_bounds.get(stem).copied().unwrap_or((0, 0));
+                let k = idx.clamp(lo, hi);
+                let name = format!("{}__{}", stem, k);
+                *signals.get(&name).unwrap_or(&0)
+            }
+        }
+    }
+
+    /// Instance output ports often connect with a full-range slice, e.g. `.hex(HEX6[6:0])`, which
+    /// lowers to [`IrExpr::PartSelect`]. We must still emit `assign HEX6 = child__hex` or the
+    /// parent port stays at its initialized 0.
+    fn output_port_lhs(expr: &IrExpr, widths: &HashMap<String, usize>) -> Option<String> {
+        match expr {
+            IrExpr::Ident(s) => Some(s.clone()),
+            IrExpr::PartSelect { value, msb, lsb } => {
+                let IrExpr::Ident(name) = value.as_ref() else {
+                    return None;
+                };
+                let (IrExpr::Const(hi), IrExpr::Const(lo)) = (msb.as_ref(), lsb.as_ref()) else {
+                    return None;
+                };
+                let w_sel = (*hi - *lo).abs() as usize + 1;
+                let w_full = widths.get(name).copied().unwrap_or(0);
+                if w_sel == w_full && w_full > 0 {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -409,6 +587,8 @@ impl<'a> Simulator<'a> {
         module_map: &HashMap<&str, &IrModule>,
         signals: &mut HashMap<String, i64>,
         widths: &mut HashMap<String, usize>,
+        mem_bounds: &mut HashMap<String, (i64, i64)>,
+        mem_elem_width: &mut HashMap<String, usize>,
         assigns: &mut Vec<IrAssign>,
         always_blocks: &mut Vec<IrAlways>,
         initial_blocks: &mut Vec<IrInitial>,
@@ -422,6 +602,12 @@ impl<'a> Simulator<'a> {
                 format!("{}__{}", prefix, name)
             }
         };
+
+        for ma in &module.mem_arrays {
+            let s = pfx(&ma.stem);
+            mem_bounds.insert(s.clone(), (ma.lo, ma.hi));
+            mem_elem_width.insert(s, ma.elem_width);
+        }
 
         for port in &module.ports {
             let full = pfx(&port.name);
@@ -488,6 +674,8 @@ impl<'a> Simulator<'a> {
                     module_map,
                     signals,
                     widths,
+                    mem_bounds,
+                    mem_elem_width,
                     assigns,
                     always_blocks,
                     initial_blocks,
@@ -497,16 +685,19 @@ impl<'a> Simulator<'a> {
                 scope.children.push(child_scope);
 
                 for conn in &inst.connections {
-                    let child_port = format!("{}__{}", inst_prefix, conn.port_name);
+                    let Some(pn) = conn.port_name.as_ref() else {
+                        continue;
+                    };
+                    let child_port = format!("{}__{}", inst_prefix, pn);
                     let parent_expr = prefix_ir_expr(&conn.expr, prefix);
                     let is_output = child
                         .ports
                         .iter()
-                        .any(|p| p.name == conn.port_name && p.direction.as_deref() == Some("output"));
+                        .any(|p| p.name == *pn && p.direction.as_deref() == Some("output"));
                     if is_output {
-                        if let IrExpr::Ident(parent_sig) = &parent_expr {
+                        if let Some(parent_sig) = Self::output_port_lhs(&parent_expr, widths) {
                             assigns.push(IrAssign {
-                                lhs: parent_sig.clone(),
+                                lhs: parent_sig,
                                 rhs: IrExpr::Ident(child_port),
                             });
                         }
@@ -572,6 +763,18 @@ impl<'a> Simulator<'a> {
 
         self.apply_initial_events_at_fs(0);
         self.eval_combinational();
+        // Combinational `always @*` blocks must run before `#0` dumpvars; otherwise only
+        // `assign`-driven nets are in `driven` and always-driven signals are dumped as X.
+        // Fixed-point: multiple always blocks can depend on each other.
+        for _ in 0..64 {
+            self.prev_signals = self.signals.clone();
+            let before = self.signals.clone();
+            self.fire_always_blocks(true);
+            self.eval_combinational();
+            if self.signals == before {
+                break;
+            }
+        }
 
         let vcd_step = |t_fs: u128| -> u128 {
             if prec_fs == 0 {
@@ -619,7 +822,7 @@ impl<'a> Simulator<'a> {
                 let mut nba = Vec::new();
                 self.exec_stmts(&stmts, &mut nba);
                 for (lhs, val) in nba {
-                    let w = self.widths.get(&lhs).copied().unwrap_or(1);
+                    let w = self.width_for_signal(&lhs);
                     self.signals.insert(lhs.clone(), mask_to_width(val, w));
                     self.driven.insert(lhs);
                 }
@@ -628,7 +831,12 @@ impl<'a> Simulator<'a> {
                     .saturating_add(period_fs);
             }
 
-            self.fire_always_blocks();
+            // `continuous assign` targets (e.g. hierarchical **Clock** = parent **CLK**) must settle
+            // before `posedge Clock` / `negedge` detection; otherwise sequential `always` never sees
+            // edges and the VCD only shows the generator clock.
+            self.eval_combinational();
+
+            self.fire_always_blocks(false);
             self.eval_combinational();
 
             let changes = self.collect_changes();
@@ -646,7 +854,7 @@ impl<'a> Simulator<'a> {
     fn apply_initial_events_at_fs(&mut self, t_fs: u128) {
         for ev in &self.initial_events {
             if ev.time_fs == t_fs {
-                let w = self.widths.get(&ev.lhs).copied().unwrap_or(1);
+                let w = self.width_for_signal(&ev.lhs);
                 let masked = mask_to_width(ev.val, w);
                 self.signals.insert(ev.lhs.clone(), masked);
                 self.driven.insert(ev.lhs.clone());
@@ -659,7 +867,7 @@ impl<'a> Simulator<'a> {
             let mut changed = false;
             for assign in &self.assigns.clone() {
                 let val = self.eval_expr(&assign.rhs);
-                let w = self.widths.get(&assign.lhs).copied().unwrap_or(1);
+                let w = self.width_for_signal(&assign.lhs);
                 let masked = mask_to_width(val, w);
                 let old = self.signals.get(&assign.lhs).copied().unwrap_or(0);
                 if masked != old {
@@ -678,31 +886,49 @@ impl<'a> Simulator<'a> {
         }
     }
 
-    fn fire_always_blocks(&mut self) {
+    /// `stabilize_level_comb`: used only when converging before `#0` dumpvars. Verilog
+    /// `always @(a or b)` lowers to an edge list of **level** sensitivities; at t=0 we have
+    /// `prev == cur` everywhere, so `cur != prev` never holds and the block would never run — same
+    /// X-on-dump bug as missing `always @*`. Pure level lists must execute once during startup.
+    fn fire_always_blocks(&mut self, stabilize_level_comb: bool) {
         let blocks = self.always_blocks.clone();
+        let mut scratch = self.signals.clone();
+        let mut nba_all: Vec<(String, i64)> = Vec::new();
+
         for ab in &blocks {
             let should_fire = match &ab.sensitivity {
                 IrSensitivity::Star => true,
-                IrSensitivity::EdgeList(edges) => edges.iter().any(|e| {
-                    let cur = *self.signals.get(&e.signal).unwrap_or(&0);
-                    let prev = *self.prev_signals.get(&e.signal).unwrap_or(&0);
-                    match e.edge {
-                        IrEdgeKind::Posedge => prev == 0 && cur == 1,
-                        IrEdgeKind::Negedge => prev == 1 && cur == 0,
-                        IrEdgeKind::Level => cur != prev,
+                IrSensitivity::EdgeList(edges) => {
+                    if stabilize_level_comb && Self::edge_list_is_pure_combinational(edges) {
+                        true
+                    } else {
+                        edges.iter().any(|e| {
+                            let cur = *self.signals.get(&e.signal).unwrap_or(&0);
+                            let prev = *self.prev_signals.get(&e.signal).unwrap_or(&0);
+                            match e.edge {
+                                IrEdgeKind::Posedge => prev == 0 && cur == 1,
+                                IrEdgeKind::Negedge => prev == 1 && cur == 0,
+                                IrEdgeKind::Level => cur != prev,
+                            }
+                        })
                     }
-                }),
+                }
             };
             if should_fire {
-                let mut nba: Vec<(String, i64)> = Vec::new();
-                self.exec_stmts(&ab.stmts, &mut nba);
-                for (lhs, val) in nba {
-                    let w = self.widths.get(&lhs).copied().unwrap_or(1);
-                    self.signals.insert(lhs.clone(), mask_to_width(val, w));
-                    self.driven.insert(lhs);
-                }
+                self.exec_stmts_on_env(&ab.stmts, &mut scratch, &mut nba_all);
             }
         }
+
+        for (lhs, val) in nba_all {
+            let w = self.width_for_signal(&lhs);
+            scratch.insert(lhs.clone(), mask_to_width(val, w));
+            self.driven.insert(lhs);
+        }
+        self.signals = scratch;
+    }
+
+    fn edge_list_is_pure_combinational(edges: &[IrSensEntry]) -> bool {
+        !edges.is_empty() && edges.iter().all(|e| matches!(e.edge, IrEdgeKind::Level))
     }
 
     fn exec_stmts(&mut self, stmts: &[IrStmt], nba: &mut Vec<(String, i64)>) {
@@ -715,14 +941,34 @@ impl<'a> Simulator<'a> {
         match stmt {
             IrStmt::BlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr(rhs);
-                let w = self.widths.get(lhs).copied().unwrap_or(1);
+                let w = self.width_for_signal(lhs);
                 self.signals.insert(lhs.clone(), mask_to_width(val, w));
                 self.driven.insert(lhs.clone());
             }
             IrStmt::NonBlockingAssign { lhs, rhs } => {
                 let val = self.eval_expr(rhs);
-                let w = self.widths.get(lhs).copied().unwrap_or(1);
+                let w = self.width_for_signal(lhs);
                 nba.push((lhs.clone(), mask_to_width(val, w)));
+            }
+            IrStmt::MemAssign {
+                stem,
+                index,
+                rhs,
+                nonblocking,
+            } => {
+                let idx = self.eval_expr(index);
+                let (lo, hi) = self.mem_bounds.get(stem).copied().unwrap_or((0, 0));
+                let k = idx.clamp(lo, hi);
+                let lhs = format!("{}__{}", stem, k);
+                let val = self.eval_expr(rhs);
+                let ew = self.mem_elem_width.get(stem).copied().unwrap_or(1);
+                let m = mask_to_width(val, ew);
+                if *nonblocking {
+                    nba.push((lhs, m));
+                } else {
+                    self.signals.insert(lhs.clone(), m);
+                    self.driven.insert(lhs);
+                }
             }
             IrStmt::IfElse { cond, then_body, else_body } => {
                 let c = self.eval_expr(cond);
@@ -771,33 +1017,135 @@ impl<'a> Simulator<'a> {
         }
     }
 
+    /// Execute statements reading/writing `scratch`; queue NBAs without applying (for cross-`always`
+    /// NBA semantics in the same timestep).
+    fn exec_stmt_on_env(
+        &mut self,
+        stmt: &IrStmt,
+        scratch: &mut std::collections::HashMap<String, i64>,
+        nba: &mut Vec<(String, i64)>,
+    ) {
+        match stmt {
+            IrStmt::BlockingAssign { lhs, rhs } => {
+                let val = self.eval_expr_with_env(rhs, scratch);
+                let w = self.width_for_signal(lhs);
+                scratch.insert(lhs.clone(), mask_to_width(val, w));
+                self.driven.insert(lhs.clone());
+            }
+            IrStmt::NonBlockingAssign { lhs, rhs } => {
+                let val = self.eval_expr_with_env(rhs, scratch);
+                let w = self.width_for_signal(lhs);
+                nba.push((lhs.clone(), mask_to_width(val, w)));
+            }
+            IrStmt::MemAssign {
+                stem,
+                index,
+                rhs,
+                nonblocking,
+            } => {
+                let idx = self.eval_expr_with_env(index, scratch);
+                let (lo, hi) = self.mem_bounds.get(stem).copied().unwrap_or((0, 0));
+                let k = idx.clamp(lo, hi);
+                let lhs = format!("{}__{}", stem, k);
+                let val = self.eval_expr_with_env(rhs, scratch);
+                let ew = self.mem_elem_width.get(stem).copied().unwrap_or(1);
+                let m = mask_to_width(val, ew);
+                if *nonblocking {
+                    nba.push((lhs, m));
+                } else {
+                    scratch.insert(lhs.clone(), m);
+                    self.driven.insert(lhs);
+                }
+            }
+            IrStmt::IfElse { cond, then_body, else_body } => {
+                let c = self.eval_expr_with_env(cond, scratch);
+                if c != 0 {
+                    self.exec_stmts_on_env(then_body, scratch, nba);
+                } else {
+                    self.exec_stmts_on_env(else_body, scratch, nba);
+                }
+            }
+            IrStmt::Case { expr, arms, default } => {
+                let val = self.eval_expr_with_env(expr, scratch);
+                let mut matched = false;
+                for arm in arms {
+                    let arm_val = self.eval_expr_with_env(&arm.value, scratch);
+                    if val == arm_val {
+                        self.exec_stmts_on_env(&arm.body, scratch, nba);
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    self.exec_stmts_on_env(default, scratch, nba);
+                }
+            }
+            IrStmt::For {
+                init_var,
+                init_val,
+                cond,
+                step_var,
+                step_expr,
+                body,
+            } => {
+                let start = self.eval_expr_with_env(init_val, scratch);
+                scratch.insert(init_var.clone(), start);
+                for _ in 0..1024 {
+                    let c = self.eval_expr_with_env(cond, scratch);
+                    if c == 0 {
+                        break;
+                    }
+                    self.exec_stmts_on_env(body, scratch, nba);
+                    let next = self.eval_expr_with_env(step_expr, scratch);
+                    scratch.insert(step_var.clone(), next);
+                }
+            }
+            IrStmt::Delay(_) | IrStmt::SystemTask { .. } => {}
+        }
+    }
+
+    fn exec_stmts_on_env(
+        &mut self,
+        stmts: &[IrStmt],
+        scratch: &mut std::collections::HashMap<String, i64>,
+        nba: &mut Vec<(String, i64)>,
+    ) {
+        for stmt in stmts {
+            self.exec_stmt_on_env(stmt, scratch, nba);
+        }
+    }
+
     // ── Expression evaluator ────────────────────────────────────────
 
     fn eval_expr(&self, expr: &IrExpr) -> i64 {
+        self.eval_expr_with_env(expr, &self.signals)
+    }
+
+    fn eval_expr_with_env(&self, expr: &IrExpr, env: &std::collections::HashMap<String, i64>) -> i64 {
         match expr {
             IrExpr::Const(v) => *v,
-            IrExpr::Ident(name) => *self.signals.get(name).unwrap_or(&0),
+            IrExpr::Ident(name) => *env.get(name).unwrap_or(&0),
             IrExpr::Binary { op, left, right } => {
-                let l = self.eval_expr(left);
-                let r = self.eval_expr(right);
+                let l = self.eval_expr_with_env(left, env);
+                let r = self.eval_expr_with_env(right, env);
                 eval_binop(*op, l, r)
             }
             IrExpr::Unary { op, operand } => {
-                let v = self.eval_expr(operand);
+                let v = self.eval_expr_with_env(operand, env);
                 eval_unop(*op, v)
             }
             IrExpr::Ternary { cond, then_expr, else_expr } => {
-                if self.eval_expr(cond) != 0 {
-                    self.eval_expr(then_expr)
+                if self.eval_expr_with_env(cond, env) != 0 {
+                    self.eval_expr_with_env(then_expr, env)
                 } else {
-                    self.eval_expr(else_expr)
+                    self.eval_expr_with_env(else_expr, env)
                 }
             }
             IrExpr::Concat(exprs) => {
                 let mut result: i64 = 0;
                 let mut shift: u32 = 0;
                 for e in exprs.iter().rev() {
-                    let v = self.eval_expr(e);
+                    let v = self.eval_expr_with_env(e, env);
                     let w = self.infer_expr_width(e);
                     let mask = if w >= 64 { !0i64 } else { (1i64 << w) - 1 };
                     result |= (v & mask) << shift;
@@ -805,15 +1153,38 @@ impl<'a> Simulator<'a> {
                 }
                 result
             }
+            IrExpr::PartSelect { value, msb, lsb } => {
+                let v = self.eval_expr_with_env(value, env);
+                let hi = self.eval_expr_with_env(msb, env);
+                let lo = self.eval_expr_with_env(lsb, env);
+                part_select_bits(v, hi, lo)
+            }
+            IrExpr::MemRead { stem, index } => {
+                let idx = self.eval_expr_with_env(index, env);
+                let (lo, hi) = self.mem_bounds.get(stem).copied().unwrap_or((0, 0));
+                let ew = self.mem_elem_width.get(stem).copied().unwrap_or(1);
+                let clamped = idx.clamp(lo, hi);
+                let name = format!("{}__{}", stem, clamped);
+                let v = *env.get(&name).unwrap_or(&0);
+                mask_to_width(v, ew)
+            }
         }
     }
 
     fn infer_expr_width(&self, expr: &IrExpr) -> u32 {
         match expr {
-            IrExpr::Ident(name) => self.widths.get(name).copied().unwrap_or(1) as u32,
+            IrExpr::Ident(name) => self.width_for_signal(name).min(64).max(1) as u32,
             IrExpr::Const(_) => 1,
             IrExpr::Concat(exprs) => exprs.iter().map(|e| self.infer_expr_width(e)).sum(),
             IrExpr::Unary { operand, .. } => self.infer_expr_width(operand),
+            IrExpr::PartSelect { msb, lsb, .. } => {
+                if let (IrExpr::Const(a), IrExpr::Const(b)) = (msb.as_ref(), lsb.as_ref()) {
+                    ((a - b).abs() + 1).max(1).min(64) as u32
+                } else {
+                    32
+                }
+            }
+            IrExpr::MemRead { stem, .. } => self.mem_elem_width.get(stem).copied().unwrap_or(1) as u32,
             IrExpr::Binary { left, right, op, .. } => {
                 match op {
                     // Comparison/logical ops always produce 1-bit
@@ -925,6 +1296,17 @@ impl<'a> Simulator<'a> {
         }
     }
 
+    fn vcd_display_name(flat: &str) -> String {
+        let parts: Vec<&str> = flat.split("__").collect();
+        if parts.len() >= 2 {
+            let last = parts[parts.len() - 1];
+            if last.chars().all(|c| c.is_ascii_digit()) {
+                return format!("{}_{}", parts[parts.len() - 2], last);
+            }
+        }
+        parts.last().copied().unwrap_or(flat).to_string()
+    }
+
     fn write_scope(&self, out: &mut String, scope: &ScopeNode) {
         writeln!(out, "$scope module {} $end", scope.name).unwrap();
         for sig in &scope.signals {
@@ -932,9 +1314,9 @@ impl<'a> Simulator<'a> {
                 Some(id) => id,
                 None => continue,
             };
-            let w = self.widths.get(sig).copied().unwrap_or(1);
+            let w = self.width_for_signal(sig);
             let var_type = if self.is_register(sig) { "reg" } else { "wire" };
-            let display_name = sig.rsplit("__").next().unwrap_or(sig);
+            let display_name = Self::vcd_display_name(sig);
             if w > 1 {
                 writeln!(out, "$var {} {} {} {} [{}:0] $end", var_type, w, id, display_name, w - 1)
                     .unwrap();
@@ -957,7 +1339,7 @@ impl<'a> Simulator<'a> {
             Some(id) => id,
             None => return,
         };
-        let w = self.widths.get(name).copied().unwrap_or(1);
+        let w = self.width_for_signal(name);
         if w == 1 {
             writeln!(out, "{}{}", val & 1, id).unwrap();
         } else {
@@ -976,7 +1358,7 @@ impl<'a> Simulator<'a> {
             Some(id) => id,
             None => return,
         };
-        let w = self.widths.get(name).copied().unwrap_or(1);
+        let w = self.width_for_signal(name);
         if w == 1 {
             writeln!(out, "x{}", id).unwrap();
         } else {
@@ -1032,6 +1414,12 @@ fn stmts_assign_to(stmts: &[IrStmt], name: &str) -> bool {
         match s {
             IrStmt::NonBlockingAssign { lhs, .. } | IrStmt::BlockingAssign { lhs, .. } => {
                 if lhs == name {
+                    return true;
+                }
+            }
+            IrStmt::MemAssign { stem, .. } => {
+                let p = format!("{}__", stem);
+                if name.starts_with(&p) {
                     return true;
                 }
             }
@@ -1106,6 +1494,19 @@ fn mask_to_width(val: i64, w: usize) -> i64 {
     }
 }
 
+/// Verilog packed select `[msb:lsb]` with bit 0 = LSB of stored value; `msb`/`lsb` are inclusive indices.
+fn part_select_bits(val: i64, msb: i64, lsb: i64) -> i64 {
+    let lo = msb.min(lsb).max(0);
+    let hi = msb.max(lsb);
+    let width_i64 = hi - lo + 1;
+    if width_i64 <= 0 {
+        return 0;
+    }
+    let width = (width_i64 as usize).min(63);
+    let sh = lo.min(63) as u32;
+    (val >> sh) & ((1i64 << width) - 1)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn current_date_string() -> String {
@@ -1160,6 +1561,19 @@ fn prefix_ir_expr(expr: &IrExpr, prefix: &str) -> IrExpr {
         IrExpr::Concat(exprs) => {
             IrExpr::Concat(exprs.iter().map(|e| prefix_ir_expr(e, prefix)).collect())
         }
+        IrExpr::PartSelect { value, msb, lsb } => IrExpr::PartSelect {
+            value: Box::new(prefix_ir_expr(value, prefix)),
+            msb: Box::new(prefix_ir_expr(msb, prefix)),
+            lsb: Box::new(prefix_ir_expr(lsb, prefix)),
+        },
+        IrExpr::MemRead { stem, index } => IrExpr::MemRead {
+            stem: if prefix.is_empty() {
+                stem.clone()
+            } else {
+                format!("{}__{}", prefix, stem)
+            },
+            index: Box::new(prefix_ir_expr(index, prefix)),
+        },
     }
 }
 
@@ -1180,6 +1594,17 @@ fn prefix_stmt(stmt: &IrStmt, prefix: &str) -> IrStmt {
         IrStmt::NonBlockingAssign { lhs, rhs } => IrStmt::NonBlockingAssign {
             lhs: pfx(lhs),
             rhs: prefix_ir_expr(rhs, prefix),
+        },
+        IrStmt::MemAssign {
+            stem,
+            index,
+            rhs,
+            nonblocking,
+        } => IrStmt::MemAssign {
+            stem: pfx(stem),
+            index: prefix_ir_expr(index, prefix),
+            rhs: prefix_ir_expr(rhs, prefix),
+            nonblocking: *nonblocking,
         },
         IrStmt::IfElse { cond, then_body, else_body } => IrStmt::IfElse {
             cond: prefix_ir_expr(cond, prefix),
@@ -1266,6 +1691,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1281,6 +1707,30 @@ mod tests {
         assert!(vcd.contains("#0"));
         assert!(vcd.contains("$enddefinitions $end"));
         assert!(vcd.contains("$dumpvars"));
+    }
+
+    #[test]
+    fn combinational_always_explicit_level_list_dumpvars_not_x() {
+        let src = r#"
+module top(input wire a, input wire b, output reg y);
+  always @(a or b) y = a & b;
+endmodule
+"#;
+        let proj = crate::build_ir_for_file("t.v", src);
+        let config = SimConfig {
+            top_module: "top".into(),
+            num_cycles: 2,
+            ..SimConfig::default()
+        };
+        let vcd = generate_vcd(&proj, &config).unwrap();
+        let d0 = vcd.find("$dumpvars").unwrap();
+        let d1 = vcd[d0..].find("$end").unwrap() + d0;
+        let dump = &vcd[d0..d1];
+        assert!(
+            !dump.contains("bx"),
+            "level-sensitivity combinational always must run before #0 dump: {}",
+            dump
+        );
     }
 
     #[test]
@@ -1355,6 +1805,7 @@ mod tests {
                     },
                 ],
             }],
+            mem_arrays: vec![],
         };
 
         let proj = make_project(vec![top]);
@@ -1401,6 +1852,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1436,6 +1888,7 @@ mod tests {
                     },
                 ],
             }],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1463,6 +1916,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1494,6 +1948,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let top = IrModule {
             name: "top".into(),
@@ -1506,17 +1961,18 @@ mod tests {
                 instance_name: "u1".into(),
                 connections: vec![
                     IrPortConn {
-                        port_name: "a".into(),
+                        port_name: Some("a".into()),
                         expr: IrExpr::Ident("in1".into()),
                     },
                     IrPortConn {
-                        port_name: "y".into(),
+                        port_name: Some("y".into()),
                         expr: IrExpr::Ident("out1".into()),
                     },
                 ],
             }],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top, child]);
         let config = SimConfig {
@@ -1542,6 +1998,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1565,6 +2022,7 @@ mod tests {
             instances: vec![],
             always_blocks: vec![],
             initial_blocks: vec![],
+            mem_arrays: vec![],
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1604,7 +2062,9 @@ mod tests {
             always_delay_procs: vec![],
             initial_events: vec![],
             initial_time_horizon_fs: 0,
-            driven: std::collections::HashSet::new(),
+            driven: HashSet::new(),
+            mem_bounds: HashMap::new(),
+            mem_elem_width: HashMap::new(),
             scope_tree: ScopeNode {
                 name: "t".into(),
                 signals: vec![],
@@ -1619,6 +2079,7 @@ mod tests {
                 instances: vec![],
                 always_blocks: vec![],
                 initial_blocks: vec![],
+                mem_arrays: vec![],
             },
         };
         assert_eq!(
