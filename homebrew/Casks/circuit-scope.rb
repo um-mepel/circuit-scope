@@ -3,18 +3,18 @@ cask "circuit-scope" do
 
   # SHA-256 checksums for the DMG attached to the GitHub Release.
   # Regenerate after each release with:
-  #   shasum -a 256 "Circuit Scope_<version>_aarch64.dmg"
-  #   shasum -a 256 "Circuit Scope_<version>_x64.dmg"
-  # Tauri's DMG bundle includes the product name with a space ("Circuit Scope_<ver>_<arch>.dmg");
-  # GitHub serves that asset URL with the space percent-encoded as %20.
+  #   shasum -a 256 "Circuit.Scope_<version>_aarch64.dmg"
+  #   shasum -a 256 "Circuit.Scope_<version>_x64.dmg"
+  # GitHub Releases normalises the space in Tauri's DMG product name to a dot,
+  # so the asset is served at `Circuit.Scope_<ver>_<arch>.dmg`.
   on_arm do
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit%20Scope_#{version}_aarch64.dmg",
+    sha256 "3d0155d0b193c662dfa47bdb503623ac88fb9add7f601ebcac66e36f49022518"
+    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit.Scope_#{version}_aarch64.dmg",
         verified: "github.com/um-mepel/circuit-scope-verilog/"
   end
   on_intel do
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit%20Scope_#{version}_x64.dmg",
+    sha256 "5c82c7a7b0241544c89cacabb7e6ebff65557649f865be978cda66c675dc535e"
+    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit.Scope_#{version}_x64.dmg",
         verified: "github.com/um-mepel/circuit-scope-verilog/"
   end
 

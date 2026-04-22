@@ -4,7 +4,7 @@ class Csverilog < Formula
   url "https://github.com/um-mepel/circuit-scope-verilog/archive/refs/tags/v0.2.2.tar.gz"
   # Regenerate after each release with:
   #   curl -L https://github.com/um-mepel/circuit-scope-verilog/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "fbe7b11cd66b81318349aa7220dc76a9de3e70e8987ba43ae9862a5792198de4"
   license "MIT"
   head "https://github.com/um-mepel/circuit-scope-verilog.git", branch: "main"
 
