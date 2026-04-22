@@ -12,9 +12,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+mod arith;
 mod csverilog_pipeline;
 pub mod codegen;
 pub mod delay_rational;
+mod expr_const;
 mod ir;
 mod timescale_util;
 pub mod lexer;
@@ -23,10 +25,10 @@ mod parser;
 mod semantic;
 
 pub use crate::ir::{
-    build_ir_for_file, build_ir_for_root, resolve_instance_port_connections,
-    sum_initial_delay_literals_for_source_file, IrAlways, IrAssign, IrBinOp, IrCaseArm, IrEdgeKind,
-    IrExpr, IrInitial, IrInstance, IrModule, IrNet, IrPortConn, IrProject, IrSensEntry,
-    IrSensitivity, IrStmt, IrUnaryOp,
+    build_ir_for_file, build_ir_for_path_bufs, build_ir_for_root, elaborate_parameterized_modules,
+    resolve_instance_port_connections, sum_initial_delay_literals_for_source_file, IrAlways,
+    IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr, IrInitial, IrInstance, IrModule, IrNet,
+    IrPortConn, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
 };
 pub use crate::lexer::{Token, TokenKind};
 pub use crate::optimizer::{optimize_module, optimize_project, optimize_module_with_metrics, OptimizeMetrics};

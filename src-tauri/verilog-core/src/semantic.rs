@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::expr_const::const_eval_param_expr;
+use crate::ir::module_locals_for_cst;
 use crate::lexer;
-use crate::parser::{self, CstFile, CstModule, CstModuleItem};
-use crate::{Diagnostic, Module, Port, SourceFile};
+use crate::parser::{self, AssignTarget, CstModule, CstModuleItem};
+use crate::{Diagnostic, Port, SourceFile};
 
 /// Summary of an entire Verilog project from the semantic analyzer.
 #[derive(Debug, Clone)]
@@ -84,6 +86,7 @@ pub fn analyze_project(root: &Path) -> std::io::Result<SemanticProject> {
 }
 
 fn build_semantic_module(cst: CstModule) -> SemanticModule {
+    let locals = module_locals_for_cst(&cst);
     let mut nets = Vec::new();
     let mut instances = Vec::new();
     let mut assigns = Vec::new();
@@ -93,7 +96,12 @@ fn build_semantic_module(cst: CstModule) -> SemanticModule {
             CstModuleItem::NetDecl { names, .. } => {
                 nets.extend(names);
             }
-            CstModuleItem::Assign { lhs, .. } => {
+            CstModuleItem::Assign { target, .. } => {
+                let lhs = match target {
+                    AssignTarget::Whole(s) => s,
+                    AssignTarget::BitSelect { reg, .. } => reg,
+                    AssignTarget::PartSelect { reg, .. } => reg,
+                };
                 assigns.push(AssignRef { lhs });
             }
             CstModuleItem::Instance {
@@ -105,6 +113,22 @@ fn build_semantic_module(cst: CstModule) -> SemanticModule {
                     module_name,
                     instance_name,
                 });
+            }
+            CstModuleItem::GenerateFor {
+                upper_expr,
+                module_name,
+                instance_stem,
+                ..
+            } => {
+                let n = const_eval_param_expr(&upper_expr, &locals)
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                for k in 0..n {
+                    instances.push(InstanceRef {
+                        module_name: module_name.clone(),
+                        instance_name: format!("{}__{}", instance_stem, k),
+                    });
+                }
             }
             CstModuleItem::Always { .. } => {}
             CstModuleItem::Initial { .. } => {}

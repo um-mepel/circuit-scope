@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "circuit_scope"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -4241,10 +4241,11 @@ dependencies = [
 
 [[package]]
 name = "verilog_core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

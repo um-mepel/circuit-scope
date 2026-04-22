@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::ir::{
-    IrAssign, IrBinOp, IrCaseArm, IrExpr, IrMemArray, IrModule, IrNet, IrProject, IrStmt,
-    IrUnaryOp,
+    ir_expr_merge_scalar_into_packed_vec, ir_net_width_in_module, ir_try_eval_const_index_expr,
+    IrAssign, IrBinOp, IrCaseArm, IrExpr, IrMemArray, IrModule, IrNet, IrProject, IrStmt, IrUnaryOp,
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -74,7 +74,9 @@ pub fn optimize_project(project: &mut IrProject) -> OptimizeMetrics {
     }
 
     // Project-level pass: module inlining (paper #2's #1 finding)
-    metrics.modules_inlined = module_inlining(project);
+    if std::env::var_os("VERILOG_CORE_SKIP_MODULE_INLINE").is_none() {
+        metrics.modules_inlined = module_inlining(project);
+    }
 
     // Per-module optimization (including loop unrolling in always blocks)
     for m in project.modules.iter_mut() {
@@ -184,7 +186,7 @@ fn expr_size(expr: &IrExpr) -> usize {
     match expr {
         IrExpr::Const(_) | IrExpr::Ident(_) => 1,
         IrExpr::Binary { left, right, .. } => 1 + expr_size(left) + expr_size(right),
-        IrExpr::Unary { operand, .. } => 1 + expr_size(operand),
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => 1 + expr_size(operand),
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             1 + expr_size(cond) + expr_size(then_expr) + expr_size(else_expr)
         }
@@ -246,7 +248,7 @@ fn canonicalize(expr: &mut IrExpr) -> usize {
                 count += 1;
             }
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += canonicalize(operand);
         }
         IrExpr::Ternary {
@@ -289,7 +291,7 @@ fn fold_expr(expr: &mut IrExpr) -> usize {
             count += fold_expr(left);
             count += fold_expr(right);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += fold_expr(operand);
         }
         IrExpr::Ternary {
@@ -522,6 +524,7 @@ fn eval_binop(op: IrBinOp, l: i64, r: i64) -> Option<i64> {
         IrBinOp::Xor => l ^ r,
         IrBinOp::Shl => l.wrapping_shl(r as u32),
         IrBinOp::Shr => ((l as u64).wrapping_shr(r as u32)) as i64,
+        IrBinOp::Ashr => crate::arith::arith_shr_i64(l, r as u32, 64),
         IrBinOp::LogAnd => if l != 0 && r != 0 { 1 } else { 0 },
         IrBinOp::LogOr => if l != 0 || r != 0 { 1 } else { 0 },
         IrBinOp::Eq => if l == r { 1 } else { 0 },
@@ -600,7 +603,7 @@ fn try_identity(op: IrBinOp, left: &IrExpr, right: &IrExpr) -> Option<IrExpr> {
             if left == right { return Some(IrExpr::Const(0)); }
             None
         }
-        IrBinOp::Shl | IrBinOp::Shr => {
+        IrBinOp::Shl | IrBinOp::Shr | IrBinOp::Ashr => {
             if rc == Some(0) { return Some(left.clone()); }
             None
         }
@@ -747,7 +750,7 @@ fn substitute_consts(expr: &mut IrExpr, map: &HashMap<String, i64>) -> usize {
             count += substitute_consts(left, map);
             count += substitute_consts(right, map);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += substitute_consts(operand, map);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -833,7 +836,7 @@ fn expr_references(expr: &IrExpr, name: &str) -> bool {
         IrExpr::Binary { left, right, .. } => {
             expr_references(left, name) || expr_references(right, name)
         }
-        IrExpr::Unary { operand, .. } => expr_references(operand, name),
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => expr_references(operand, name),
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             expr_references(cond, name)
                 || expr_references(then_expr, name)
@@ -858,7 +861,7 @@ fn expr_depth(expr: &IrExpr) -> usize {
         IrExpr::Binary { left, right, .. } => {
             1 + expr_depth(left).max(expr_depth(right))
         }
-        IrExpr::Unary { operand, .. } => 1 + expr_depth(operand),
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => 1 + expr_depth(operand),
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             1 + expr_depth(cond).max(expr_depth(then_expr)).max(expr_depth(else_expr))
         }
@@ -889,7 +892,7 @@ fn substitute_copies(expr: &mut IrExpr, map: &HashMap<String, IrExpr>, skip: &st
             count += substitute_copies(left, map, skip);
             count += substitute_copies(right, map, skip);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += substitute_copies(operand, map, skip);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -943,6 +946,10 @@ fn hash_expr(expr: &IrExpr, state: &mut impl Hasher) {
             3u8.hash(state);
             (*op as u8).hash(state);
             hash_expr(operand, state);
+        }
+        IrExpr::Signed(inner) => {
+            8u8.hash(state);
+            hash_expr(inner, state);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             4u8.hash(state);
@@ -1025,7 +1032,7 @@ fn substitute_aliases(expr: &mut IrExpr, map: &HashMap<String, String>) -> usize
             count += substitute_aliases(left, map);
             count += substitute_aliases(right, map);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += substitute_aliases(operand, map);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -1094,7 +1101,7 @@ fn collect_idents(expr: &IrExpr, set: &mut HashSet<String>) {
             collect_idents(left, set);
             collect_idents(right, set);
         }
-        IrExpr::Unary { operand, .. } => { collect_idents(operand, set); }
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => { collect_idents(operand, set); }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             collect_idents(cond, set);
             collect_idents(then_expr, set);
@@ -1220,7 +1227,7 @@ fn simplify_xz_guards(expr: &mut IrExpr, validity: &HashMap<String, ValueDomain>
             count += simplify_xz_guards(left, validity);
             count += simplify_xz_guards(right, validity);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += simplify_xz_guards(operand, validity);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -1289,7 +1296,7 @@ fn infer_domain(expr: &IrExpr, map: &HashMap<String, ValueDomain>) -> ValueDomai
                 ValueDomain::FourState
             }
         }
-        IrExpr::Unary { operand, .. } => infer_domain(operand, map),
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => infer_domain(operand, map),
         IrExpr::Ternary { cond, then_expr, else_expr } => {
             let c = infer_domain(cond, map);
             let t = infer_domain(then_expr, map);
@@ -1334,24 +1341,34 @@ fn infer_domain(expr: &IrExpr, map: &HashMap<String, ValueDomain>) -> ValueDomai
 const MAX_INLINE_ASSIGNS: usize = 16;
 
 /// See `module_inlining`: port map `.hex(HEX6[6:0])` is a PartSelect, not an Ident.
-fn inline_drive_lhs(mapped: &IrExpr, child: &IrModule, child_lhs_port: &str) -> Option<String> {
+///
+/// Returns the parent net to drive only when the connection spans the **full parent vector**
+/// (`w_sel == parent width`). Comparing only to the child port width wrongly treats `S[i]` (1 bit)
+/// as a "full" drive of an 11-bit `S`, and inlining would emit `assign S = <1-bit>` clobbering
+/// other bits (ripple adders).
+fn inline_drive_lhs(
+    mapped: &IrExpr,
+    child: &IrModule,
+    child_lhs_port: &str,
+    parent: &IrModule,
+) -> Option<String> {
     match mapped {
         IrExpr::Ident(name) => Some(name.clone()),
         IrExpr::PartSelect { value, msb, lsb } => {
             let IrExpr::Ident(name) = value.as_ref() else {
                 return None;
             };
-            let (IrExpr::Const(hi), IrExpr::Const(lo)) = (msb.as_ref(), lsb.as_ref()) else {
-                return None;
-            };
-            let w_sel = (*hi - *lo).abs() as usize + 1;
+            let hi = ir_try_eval_const_index_expr(msb)?;
+            let lo = ir_try_eval_const_index_expr(lsb)?;
+            let w_sel = (hi - lo).abs() as usize + 1;
             let w_port = child
                 .ports
                 .iter()
                 .find(|p| p.name == child_lhs_port)
                 .map(|p| p.width)
                 .unwrap_or(0);
-            if w_sel == w_port && w_port > 0 {
+            let w_full = ir_net_width_in_module(parent, name);
+            if w_sel == w_full && w_full > 0 && w_sel == w_port {
                 Some(name.clone())
             } else {
                 None
@@ -1408,14 +1425,60 @@ fn module_inlining(project: &mut IrProject) -> usize {
                         }
                     }
                     for assign in &child.assigns {
+                        let mut rhs = substitute_expr(&assign.rhs, &subst, &prefix);
                         let lhs = if let Some(mapped) = subst.get(&assign.lhs) {
-                            inline_drive_lhs(mapped, child, &assign.lhs).unwrap_or_else(|| {
-                                format!("{}{}", prefix, assign.lhs)
-                            })
+                            // Any assign LHS listed in the port map is a submodule port. Do **not**
+                            // require `direction == Some("output")`: legacy `module M(a,b)` headers leave
+                            // `Port.direction` unset even when `output s;` appears in the body, and we
+                            // would otherwise keep `prefix+s` nets that DCE drops (AddSub ripple).
+                            if let IrExpr::PartSelect { value, msb, lsb } = mapped {
+                                if let IrExpr::Ident(vec_name) = value.as_ref() {
+                                    if let (Some(k_hi), Some(k_lo)) =
+                                        (ir_try_eval_const_index_expr(msb), ir_try_eval_const_index_expr(lsb))
+                                    {
+                                        if k_hi == k_lo {
+                                            let w_full = ir_net_width_in_module(parent, vec_name);
+                                            let w_port = child
+                                                .ports
+                                                .iter()
+                                                .find(|p| p.name == assign.lhs)
+                                                .map(|p| p.width)
+                                                .unwrap_or(1);
+                                            if w_port == 1
+                                                && w_full > 1
+                                                && k_hi >= 0
+                                                && (k_hi as usize) < w_full
+                                            {
+                                                rhs = ir_expr_merge_scalar_into_packed_vec(
+                                                    vec_name,
+                                                    k_hi,
+                                                    rhs,
+                                                    w_full,
+                                                );
+                                                vec_name.clone()
+                                            } else {
+                                                inline_drive_lhs(mapped, child, &assign.lhs, parent)
+                                                    .unwrap_or_else(|| format!("{}{}", prefix, assign.lhs))
+                                            }
+                                        } else {
+                                            inline_drive_lhs(mapped, child, &assign.lhs, parent)
+                                                .unwrap_or_else(|| format!("{}{}", prefix, assign.lhs))
+                                        }
+                                    } else {
+                                        inline_drive_lhs(mapped, child, &assign.lhs, parent)
+                                            .unwrap_or_else(|| format!("{}{}", prefix, assign.lhs))
+                                    }
+                                } else {
+                                    inline_drive_lhs(mapped, child, &assign.lhs, parent)
+                                        .unwrap_or_else(|| format!("{}{}", prefix, assign.lhs))
+                                }
+                            } else {
+                                inline_drive_lhs(mapped, child, &assign.lhs, parent)
+                                    .unwrap_or_else(|| format!("{}{}", prefix, assign.lhs))
+                            }
                         } else {
                             format!("{}{}", prefix, assign.lhs)
                         };
-                        let rhs = substitute_expr(&assign.rhs, &subst, &prefix);
                         new_assigns.push(IrAssign { lhs, rhs });
                     }
                     for ma in &child.mem_arrays {
@@ -1467,6 +1530,7 @@ fn substitute_expr(
             op: *op,
             operand: Box::new(substitute_expr(operand, subst, prefix)),
         },
+        IrExpr::Signed(inner) => IrExpr::Signed(Box::new(substitute_expr(inner, subst, prefix))),
         IrExpr::Ternary { cond, then_expr, else_expr } => IrExpr::Ternary {
             cond: Box::new(substitute_expr(cond, subst, prefix)),
             then_expr: Box::new(substitute_expr(then_expr, subst, prefix)),
@@ -1504,7 +1568,7 @@ fn peephole(expr: &mut IrExpr) -> usize {
             count += peephole(left);
             count += peephole(right);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += peephole(operand);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -1666,7 +1730,7 @@ fn sink_expr(expr: &mut IrExpr) -> usize {
             count += sink_expr(left);
             count += sink_expr(right);
         }
-        IrExpr::Unary { operand, .. } => {
+        IrExpr::Unary { operand, .. } | IrExpr::Signed(operand) => {
             count += sink_expr(operand);
         }
         IrExpr::Ternary { cond, then_expr, else_expr } => {
@@ -1987,6 +2051,7 @@ fn substitute_loop_var(expr: &IrExpr, var: &str, val: i64) -> IrExpr {
             op: *op,
             operand: Box::new(substitute_loop_var(operand, var, val)),
         },
+        IrExpr::Signed(inner) => IrExpr::Signed(Box::new(substitute_loop_var(inner, var, val))),
         IrExpr::Ternary { cond, then_expr, else_expr } => IrExpr::Ternary {
             cond: Box::new(substitute_loop_var(cond, var, val)),
             then_expr: Box::new(substitute_loop_var(then_expr, var, val)),
@@ -2028,6 +2093,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         }
     }
 
@@ -2839,6 +2905,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let parent = IrModule {
             name: "top".into(),
@@ -2848,6 +2915,7 @@ mod tests {
             assigns: vec![],
             instances: vec![IrInstance {
                 module_name: "inverter".into(),
+                parameter_assignments: vec![],
                 instance_name: "u0".into(),
                 connections: vec![
                     IrPortConn {
@@ -2863,6 +2931,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
@@ -2874,6 +2943,90 @@ mod tests {
         assert!(top.instances.is_empty(), "instance should be removed");
         // With port mapping: y is mapped to z, so assign z = ...
         assert!(top.assigns.iter().any(|a| a.lhs == "z"), "output port should be wired");
+    }
+
+    /// `c[i+1]` after generate lowering uses `IrExpr::Binary` indices; inlining must still RMW
+    /// into the parent packed net (same requirement as codegen flatten).
+    #[test]
+    fn module_inline_merges_output_into_packed_vec_when_partselect_msb_is_binary_add() {
+        use crate::ir::{IrInstance, IrPortConn, IrProject};
+
+        let child = IrModule {
+            name: "BitDrv".into(),
+            path: "b.v".into(),
+            ports: vec![
+                Port {
+                    direction: Some("input".into()),
+                    name: "a".into(),
+                    width: 1,
+                },
+                Port {
+                    direction: Some("output".into()),
+                    name: "cout".into(),
+                    width: 1,
+                },
+            ],
+            nets: vec![],
+            assigns: vec![IrAssign {
+                lhs: "cout".into(),
+                rhs: id("a"),
+            }],
+            instances: vec![],
+            always_blocks: vec![],
+            initial_blocks: vec![],
+            mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
+        };
+        let parent = IrModule {
+            name: "Top".into(),
+            path: "t.v".into(),
+            ports: vec![],
+            nets: vec![IrNet {
+                name: "carry".into(),
+                width: 5,
+            }],
+            assigns: vec![],
+            instances: vec![IrInstance {
+                module_name: "BitDrv".into(),
+                instance_name: "u0".into(),
+                parameter_assignments: vec![],
+                connections: vec![
+                    IrPortConn {
+                        port_name: Some("a".into()),
+                        expr: IrExpr::Const(1),
+                    },
+                    IrPortConn {
+                        port_name: Some("cout".into()),
+                        expr: IrExpr::PartSelect {
+                            value: Box::new(IrExpr::Ident("carry".into())),
+                            msb: Box::new(bin(IrBinOp::Add, c(0), c(1))),
+                            lsb: Box::new(bin(IrBinOp::Add, c(0), c(1))),
+                        },
+                    },
+                ],
+            }],
+            always_blocks: vec![],
+            initial_blocks: vec![],
+            mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
+        };
+        let mut proj = IrProject {
+            modules: vec![child, parent],
+            diagnostics: vec![],
+        };
+        let _ = optimize_project(&mut proj);
+        let top = proj.modules.iter().find(|m| m.name == "Top").unwrap();
+        assert!(top.instances.is_empty(), "instance should inline away");
+        assert!(
+            !top.assigns.iter().any(|a| a.lhs == "u0__cout"),
+            "inlined 1-bit output must map into `carry`, not stay as prefixed net (assigns={:?})",
+            top.assigns
+        );
+        assert!(
+            top.assigns.iter().any(|a| a.lhs == "carry"),
+            "expected driver onto parent packed net `carry`, assigns={:?}",
+            top.assigns
+        );
     }
 
     #[test]
@@ -2893,6 +3046,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let parent = IrModule {
             name: "top".into(),
@@ -2900,10 +3054,16 @@ mod tests {
             ports: vec![],
             nets: vec![],
             assigns: vec![],
-            instances: vec![IrInstance { module_name: "big".into(), instance_name: "u0".into(), connections: vec![] }],
+            instances: vec![IrInstance {
+                module_name: "big".into(),
+                parameter_assignments: vec![],
+                instance_name: "u0".into(),
+                connections: vec![],
+            }],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
@@ -2925,10 +3085,16 @@ mod tests {
             ports: vec![],
             nets: vec![],
             assigns: vec![IrAssign { lhs: "w".into(), rhs: c(1) }],
-            instances: vec![IrInstance { module_name: "deep".into(), instance_name: "sub".into(), connections: vec![] }],
+            instances: vec![IrInstance {
+                module_name: "deep".into(),
+                parameter_assignments: vec![],
+                instance_name: "sub".into(),
+                connections: vec![],
+            }],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let parent = IrModule {
             name: "top".into(),
@@ -2936,10 +3102,16 @@ mod tests {
             ports: vec![],
             nets: vec![],
             assigns: vec![],
-            instances: vec![IrInstance { module_name: "has_sub".into(), instance_name: "u0".into(), connections: vec![] }],
+            instances: vec![IrInstance {
+                module_name: "has_sub".into(),
+                parameter_assignments: vec![],
+                instance_name: "u0".into(),
+                connections: vec![],
+            }],
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let mut proj = IrProject {
             modules: vec![child, parent],
@@ -2971,6 +3143,7 @@ mod tests {
                 }],
             }],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let parent = IrModule {
             name: "top".into(),
@@ -2980,6 +3153,7 @@ mod tests {
             assigns: vec![],
             instances: vec![IrInstance {
                 module_name: "with_init".into(),
+                parameter_assignments: vec![],
                 instance_name: "u0".into(),
                 connections: vec![IrPortConn {
                     port_name: Some("y".into()),
@@ -2989,6 +3163,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let mut proj = IrProject {
             modules: vec![child, parent],

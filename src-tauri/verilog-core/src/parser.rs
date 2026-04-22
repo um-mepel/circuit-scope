@@ -14,6 +14,8 @@ pub struct CstFile {
 pub struct CstModule {
     pub name: String,
     pub ports: Vec<Port>,
+    /// `#(parameter W = 16, ...)` from the module header.
+    pub module_parameters: Vec<(String, Expr)>,
     pub path: String,
     pub items: Vec<CstModuleItem>,
 }
@@ -23,17 +25,23 @@ pub struct CstModule {
 pub enum CstModuleItem {
     NetDecl {
         kind: NetKind,
+        /// Packed `[msb:lsb]` when present; scalar width uses `width` when this is `None`.
+        packed_dim: Option<(Expr, Expr)>,
         width: usize,
         names: Vec<String>,
-        /// Stems for unpacked dimensions (`reg [6:0] x[0:10]` → stem `x`, scalar nets `x__0`…).
-        unpacked_stems: Vec<(String, i64, i64)>,
+        /// Unpacked `[hi:lo]` per stem (`x[0:9]`); bounds may be expressions (e.g. `[BoothIter-1:0]`).
+        unpacked_stems: Vec<(String, Expr, Expr)>,
+        /// `input` / `output` / `inout` from a directional port declaration in the module body.
+        decl_dir: Option<String>,
     },
     Assign {
-        lhs: String,
+        target: AssignTarget,
         expr: Expr,
     },
     Instance {
         module_name: String,
+        /// `#(.param(expr), …)` — empty if no parameter override list.
+        parameter_assignments: Vec<(String, Expr)>,
         instance_name: String,
         connections: Vec<PortConnection>,
     },
@@ -47,6 +55,16 @@ pub enum CstModuleItem {
     /// `localparam` / `parameter` assignments (`localparam a = 1, b = 2;`).
     LocalParam {
         assignments: Vec<(String, Expr)>,
+    },
+    /// `generate for (i=0; i<N; i=i+1) begin … <one instance> end` — expanded during IR lowering
+    /// so `N` uses the module's **current** parameters (specialized `#(.W(11))`, etc.).
+    GenerateFor {
+        loop_var: String,
+        upper_expr: Expr,
+        module_name: String,
+        parameter_assignments: Vec<(String, Expr)>,
+        instance_stem: String,
+        connections: Vec<PortConnection>,
     },
 }
 
@@ -154,6 +172,10 @@ pub enum Expr {
         msb: Box<Expr>,
         lsb: Option<Box<Expr>>,
     },
+    /// `$clog2(expr)` — ceiling log2; evaluated for parameters/localparams.
+    Clog2(Box<Expr>),
+    /// `$signed(expr)` — interpret packed value as signed (IEEE 1364).
+    Signed(Box<Expr>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -168,6 +190,7 @@ pub enum BinaryOp {
     Xor,      // ^
     Shl,      // <<
     Shr,      // >>
+    Ashr,     // >>>
     LogAnd,   // &&
     LogOr,    // ||
     Eq,       // ==
@@ -184,24 +207,6 @@ pub enum UnaryOp {
     LogNot, // !
     Neg,    // -
     Pos,    // +
-}
-
-/// Extract bit-width from a `[high:low]` token slice. Returns 1 if no valid
-/// range is found.
-fn extract_range_width(tokens: &[Token]) -> usize {
-    // Look for pattern: `[` number `:` number `]`
-    let nums: Vec<i64> = tokens
-        .iter()
-        .filter(|t| t.kind == TokenKind::Number)
-        .filter_map(|t| t.lexeme.parse::<i64>().ok())
-        .collect();
-    if nums.len() >= 2 {
-        let high = nums[0];
-        let low = nums[1];
-        ((high - low).abs() + 1) as usize
-    } else {
-        1
-    }
 }
 
 pub(crate) fn parse_cst<'a>(
@@ -310,105 +315,72 @@ impl<'a> Parser<'a> {
         let name = self.expect_identifier("expected module name")?;
         let mut ports = Vec::new();
 
-        // Optional parameter list: #(parameter ...) — skip it.
-        if self.match_kind(TokenKind::Hash) {
-            let _ = self.match_kind(TokenKind::LParen);
-            while self.current().kind != TokenKind::RParen
-                && self.current().kind != TokenKind::Eof
-            {
-                self.bump();
-            }
-            let _ = self.match_kind(TokenKind::RParen);
-        }
+        let module_parameters = self.parse_module_parameter_list();
 
         if self.match_kind(TokenKind::LParen) {
-            // ANSI lists: `output [6:0] a, b` applies output and vector width to both ports.
+            // ANSI lists: `output [6:0] a, b` repeats direction and vector width for comma-separated names.
+            // Parametric ranges like `[W-1:0]` must be parsed as expressions and evaluated (see eval).
             let mut last_port_direction: Option<String> = None;
             let mut last_port_width: usize = 1;
-            loop {
-                while !matches!(
-                    self.current().kind,
-                    TokenKind::Input
-                        | TokenKind::Output
-                        | TokenKind::Inout
-                        | TokenKind::Identifier
-                        | TokenKind::RParen
-                        | TokenKind::Eof
-                ) {
-                    self.bump();
-                }
-                if matches!(
-                    self.current().kind,
-                    TokenKind::RParen | TokenKind::Eof
-                ) {
-                    break;
+            'ansi_ports: loop {
+                if matches!(self.current().kind, TokenKind::RParen | TokenKind::Eof) {
+                    break 'ansi_ports;
                 }
 
                 let direction = if matches!(
                     self.current().kind,
                     TokenKind::Input | TokenKind::Output | TokenKind::Inout
                 ) {
-                    let d = Some(self.current().lexeme.clone());
+                    let d = self.current().lexeme.clone();
                     self.bump();
-                    last_port_direction = d.clone();
-                    last_port_width = 1;
-                    d
-                } else {
-                    last_port_direction.clone()
-                };
-
-                let (name, width) = {
-                    let start_idx = self.pos;
-                    while !matches!(
+                    last_port_direction = Some(d.clone());
+                    // Optional net type: `wire` / `reg` / `logic` (e.g. `input wire clk`).
+                    if matches!(
                         self.current().kind,
-                        TokenKind::Comma
-                            | TokenKind::RParen
-                            | TokenKind::Eof
-                            | TokenKind::Assign
-                            | TokenKind::Module
-                            | TokenKind::Endmodule
+                        TokenKind::Wire | TokenKind::Reg | TokenKind::Logic
                     ) {
                         self.bump();
                     }
-                    let end_idx = self.pos;
-                    let mut found_name: Option<(usize, String)> = None;
-                    for idx in (start_idx..end_idx).rev() {
-                        if self.tokens[idx].kind == TokenKind::Identifier {
-                            found_name =
-                                Some((idx + 1, self.tokens[idx].lexeme.clone()));
-                            break;
-                        }
+                    if self.current().kind == TokenKind::Signed {
+                        self.bump();
                     }
-                    let slice = &self.tokens[start_idx..end_idx];
-                    let w_declared = extract_range_width(slice);
-                    let has_packed_dim = slice.iter().any(|t| t.kind == TokenKind::LBracket);
-                    let w = if has_packed_dim {
-                        w_declared
+                    if self.current().kind == TokenKind::LBracket {
+                        self.bump();
+                        let msb = self.parse_expression(0);
+                        let lsb = if self.match_kind(TokenKind::Colon) {
+                            self.parse_expression(0)
+                        } else {
+                            msb.clone()
+                        };
+                        let _ = self.match_kind(TokenKind::RBracket);
+                        last_port_width =
+                            Self::eval_port_packed_width(&msb, &lsb, &module_parameters);
                     } else {
-                        last_port_width
-                    };
-                    last_port_width = w;
-                    if let Some((next_pos, name)) = found_name {
-                        self.pos = next_pos;
-                        (Some(name), w)
-                    } else {
-                        (None, w)
+                        last_port_width = 1;
                     }
+                    Some(d)
+                } else if self.current().kind == TokenKind::Identifier {
+                    // Continuation after `input [7:0] a,` **or** legacy `(a, b, c)` with no directions.
+                    if last_port_direction.is_none() {
+                        last_port_width = 1;
+                    }
+                    last_port_direction.clone()
+                } else {
+                    self.error_at_current("expected port direction or name");
+                    break 'ansi_ports;
                 };
 
-                if let Some(port_name) = name {
-                    ports.push(Port {
-                        direction,
-                        name: port_name,
-                        width,
-                    });
-                } else {
-                    self.error_at_current("expected port name");
-                    break;
-                }
+                let Some(port_name) = self.expect_identifier("expected port name") else {
+                    break 'ansi_ports;
+                };
+                ports.push(Port {
+                    direction,
+                    name: port_name,
+                    width: last_port_width,
+                });
 
                 if !self.match_kind(TokenKind::Comma) {
-                    break;
+                    break 'ansi_ports;
                 }
             }
 
@@ -445,7 +417,19 @@ impl<'a> Parser<'a> {
         while self.current().kind != TokenKind::Endmodule
             && self.current().kind != TokenKind::Eof
         {
-            if self.current().kind == TokenKind::Wire
+            if self.current().kind == TokenKind::Genvar {
+                self.skip_genvar_statement();
+            } else if self.current().kind == TokenKind::Generate {
+                let mut inner = self.parse_generate_construct();
+                items.append(&mut inner);
+            } else if matches!(
+                self.current().kind,
+                TokenKind::Input | TokenKind::Output | TokenKind::Inout
+            ) {
+                if let Some(item) = self.parse_directional_net_decl() {
+                    items.push(item);
+                }
+            } else if self.current().kind == TokenKind::Wire
                 || self.current().kind == TokenKind::Reg
                 || self.current().kind == TokenKind::Integer
                 || self.current().kind == TokenKind::Logic
@@ -487,6 +471,7 @@ impl<'a> Parser<'a> {
         Some(CstModule {
             name,
             ports,
+            module_parameters,
             path: self.file.path.clone(),
             items,
         })
@@ -499,6 +484,179 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let _ = self.match_kind(TokenKind::Semicolon);
+    }
+
+    fn skip_genvar_statement(&mut self) {
+        self.bump(); // genvar
+        let _ = self.skip_to_semicolon();
+    }
+
+    /// Bit-width of `[msb:lsb]` for ANSI ports using module-parameter environment only.
+    fn eval_port_packed_width(
+        msb: &Expr,
+        lsb: &Expr,
+        module_parameters: &[(String, Expr)],
+    ) -> usize {
+        let known = crate::expr_const::resolve_local_param_values(module_parameters);
+        let m = crate::expr_const::const_eval_param_expr(msb, &known).unwrap_or(1);
+        let l = crate::expr_const::const_eval_param_expr(lsb, &known).unwrap_or(1);
+        ((m - l).abs() as usize).saturating_add(1).max(1)
+    }
+
+    fn skip_to_endgenerate(&mut self) {
+        while self.current().kind != TokenKind::Endgenerate
+            && self.current().kind != TokenKind::Eof
+        {
+            self.bump();
+        }
+        let _ = self.match_kind(TokenKind::Endgenerate);
+    }
+
+    fn parse_module_parameter_list(&mut self) -> Vec<(String, Expr)> {
+        let mut v = Vec::new();
+        if !self.match_kind(TokenKind::Hash) {
+            return v;
+        }
+        if !self.match_kind(TokenKind::LParen) {
+            return v;
+        }
+        while self.current().kind != TokenKind::RParen && self.current().kind != TokenKind::Eof {
+            if self.current().kind == TokenKind::Parameter {
+                self.bump();
+            }
+            let Some(pname) = self.expect_identifier("expected parameter name") else {
+                break;
+            };
+            if !self.match_kind(TokenKind::Eq) {
+                self.error_at_current("expected `=` in module parameter list");
+                while self.current().kind != TokenKind::RParen && self.current().kind != TokenKind::Eof {
+                    self.bump();
+                }
+                break;
+            }
+            let rhs = self.parse_expression(0);
+            v.push((pname, rhs));
+            if self.match_kind(TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        let _ = self.match_kind(TokenKind::RParen);
+        v
+    }
+
+    fn parse_directional_net_decl(&mut self) -> Option<CstModuleItem> {
+        if !matches!(
+            self.current().kind,
+            TokenKind::Input | TokenKind::Output | TokenKind::Inout
+        ) {
+            return None;
+        }
+        let decl_dir = self.current().lexeme.clone();
+        self.bump();
+        let mut item = self.parse_net_decl_core(NetKind::Wire)?;
+        if let CstModuleItem::NetDecl { decl_dir: d, .. } = &mut item {
+            *d = Some(decl_dir);
+        }
+        Some(item)
+    }
+
+    /// `generate … endgenerate` with `for (i=0; i<W; i=i+1) begin : … <one instance>; end`.
+    fn parse_generate_construct(&mut self) -> Vec<CstModuleItem> {
+        self.bump(); // generate
+        if self.current().kind != TokenKind::For {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        self.bump(); // for
+        if !self.match_kind(TokenKind::LParen) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let loop_var = match self.expect_identifier("expected loop variable") {
+            Some(v) => v,
+            None => {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+        };
+        if !self.match_kind(TokenKind::Eq) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let _init = self.parse_expression(0);
+        if !self.match_kind(TokenKind::Semicolon) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let _iter = match self.expect_identifier("expected loop variable") {
+            Some(v) => v,
+            None => {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+        };
+        if !self.match_kind(TokenKind::Lt) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let upper_expr = self.parse_expression(0);
+        if !self.match_kind(TokenKind::Semicolon) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let _lhs = match self.expect_identifier("expected loop variable") {
+            Some(v) => v,
+            None => {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+        };
+        if !self.match_kind(TokenKind::Eq) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        let _step = self.parse_expression(0);
+        if !self.match_kind(TokenKind::RParen) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        if !self.match_kind(TokenKind::Begin) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        if self.current().kind == TokenKind::Colon {
+            self.bump();
+            let _ = self.expect_identifier("expected block name after begin:");
+        }
+        let inst = match self.parse_instance_like() {
+            Some(CstModuleItem::Instance {
+                module_name,
+                parameter_assignments,
+                instance_name,
+                connections,
+            }) => (module_name, parameter_assignments, instance_name, connections),
+            _ => {
+                self.skip_to_endgenerate();
+                return Vec::new();
+            }
+        };
+        if !self.match_kind(TokenKind::End) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        if !self.match_kind(TokenKind::Endgenerate) {
+            self.skip_to_endgenerate();
+            return Vec::new();
+        }
+        vec![CstModuleItem::GenerateFor {
+            loop_var,
+            upper_expr,
+            module_name: inst.0.clone(),
+            parameter_assignments: inst.1.clone(),
+            instance_stem: inst.2.clone(),
+            connections: inst.3.clone(),
+        }]
     }
 
     /// After consuming the `parameter` / `localparam` keyword: optional `[high:low]`, then
@@ -536,27 +694,36 @@ impl<'a> Parser<'a> {
             _ => NetKind::Reg,
         };
         self.bump();
+        self.parse_net_decl_core(kind)
+    }
 
+    fn parse_net_decl_core(&mut self, kind: NetKind) -> Option<CstModuleItem> {
         let mut width = if kind == NetKind::Reg && self.tokens[self.pos - 1].lexeme == "integer" {
             32
         } else {
             1
         };
 
+        if self.current().kind == TokenKind::Signed {
+            self.bump();
+        }
+
+        let mut packed_dim: Option<(Expr, Expr)> = None;
         if self.current().kind == TokenKind::LBracket {
-            let range_start = self.pos;
-            while self.current().kind != TokenKind::RBracket
-                && self.current().kind != TokenKind::Eof
-            {
-                self.bump();
-            }
-            let range_end = self.pos;
+            self.bump(); // [
+            let msb = self.parse_expression(0);
+            let lsb = if self.match_kind(TokenKind::Colon) {
+                self.parse_expression(0)
+            } else {
+                msb.clone()
+            };
             let _ = self.match_kind(TokenKind::RBracket);
-            width = extract_range_width(&self.tokens[range_start..range_end]);
+            packed_dim = Some((msb, lsb));
+            width = 1;
         }
 
         let mut names = Vec::new();
-        let mut unpacked_stems: Vec<(String, i64, i64)> = Vec::new();
+        let mut unpacked_stems: Vec<(String, Expr, Expr)> = Vec::new();
         loop {
             let stem = match self.expect_identifier("expected signal name") {
                 Some(n) => n,
@@ -564,31 +731,15 @@ impl<'a> Parser<'a> {
             };
             if self.current().kind == TokenKind::LBracket {
                 self.bump();
-                let hi = match self.parse_dim_literal() {
-                    Some(v) => v,
-                    None => {
-                        self.skip_to_semicolon();
-                        return None;
-                    }
-                };
+                let hi = self.parse_expression(0);
                 let lo = if self.match_kind(TokenKind::Colon) {
-                    match self.parse_dim_literal() {
-                        Some(v) => v,
-                        None => {
-                            self.skip_to_semicolon();
-                            return None;
-                        }
-                    }
+                    self.parse_expression(0)
                 } else {
-                    hi
+                    hi.clone()
                 };
                 let _ = self.match_kind(TokenKind::RBracket);
-                let low = hi.min(lo);
-                let high = hi.max(lo);
-                for i in low..=high {
-                    names.push(format!("{}__{}", stem, i));
-                }
-                unpacked_stems.push((stem, low, high));
+                unpacked_stems.push((stem.clone(), hi, lo));
+                names.push(stem);
             } else {
                 names.push(stem);
             }
@@ -602,58 +753,63 @@ impl<'a> Parser<'a> {
         } else {
             Some(CstModuleItem::NetDecl {
                 kind,
+                packed_dim,
                 width,
                 names,
                 unpacked_stems,
+                decl_dir: None,
             })
-        }
-    }
-
-    fn parse_dim_literal(&mut self) -> Option<i64> {
-        if self.current().kind == TokenKind::Number {
-            let v = self.current().lexeme.parse::<i64>().ok()?;
-            self.bump();
-            Some(v)
-        } else {
-            self.error_at_current("expected numeric dimension in []");
-            None
         }
     }
 
     fn parse_assign(&mut self) -> Option<CstModuleItem> {
         self.bump(); // consume 'assign'
-        let lhs = match self.expect_identifier("expected left-hand side of assign") {
+        let reg = match self.expect_identifier("expected left-hand side of assign") {
             Some(name) => name,
             None => {
                 self.skip_to_semicolon();
                 return None;
             }
         };
+        let target = self.parse_assign_target_suffix(reg);
         let _ = self.match_kind(TokenKind::Eq);
         let expr = self.parse_expression(0);
         self.skip_to_semicolon();
-        Some(CstModuleItem::Assign { lhs, expr })
+        Some(CstModuleItem::Assign { target, expr })
     }
 
     fn parse_instance_like(&mut self) -> Option<CstModuleItem> {
         let module_name = self.current().lexeme.clone();
         self.bump();
+        let mut parameter_assignments = Vec::new();
+        if self.match_kind(TokenKind::Hash) {
+            if self.match_kind(TokenKind::LParen) {
+                while self.current().kind != TokenKind::RParen
+                    && self.current().kind != TokenKind::Eof
+                {
+                    if !self.match_kind(TokenKind::Dot) {
+                        break;
+                    }
+                    let pname = match self.expect_identifier("expected parameter name after `.`") {
+                        Some(n) => n,
+                        None => break,
+                    };
+                    if !self.match_kind(TokenKind::LParen) {
+                        break;
+                    }
+                    let rhs = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::RParen);
+                    parameter_assignments.push((pname, rhs));
+                    let _ = self.match_kind(TokenKind::Comma);
+                }
+                let _ = self.match_kind(TokenKind::RParen);
+            }
+        }
         let instance_name =
             match self.expect_identifier("expected instance name after module name") {
                 Some(n) => n,
                 None => return None,
             };
-
-        // Optional parameter override: #(...)
-        if self.match_kind(TokenKind::Hash) {
-            let _ = self.match_kind(TokenKind::LParen);
-            while self.current().kind != TokenKind::RParen
-                && self.current().kind != TokenKind::Eof
-            {
-                self.bump();
-            }
-            let _ = self.match_kind(TokenKind::RParen);
-        }
 
         let mut connections = Vec::new();
         if self.match_kind(TokenKind::LParen) {
@@ -687,6 +843,7 @@ impl<'a> Parser<'a> {
         self.skip_to_semicolon();
         Some(CstModuleItem::Instance {
             module_name,
+            parameter_assignments,
             instance_name,
             connections,
         })
@@ -972,6 +1129,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Ge     => (BinaryOp::Ge, 7),
                 TokenKind::Shl    => (BinaryOp::Shl, 8),
                 TokenKind::Shr    => (BinaryOp::Shr, 8),
+                TokenKind::Ashr   => (BinaryOp::Ashr, 8),
                 TokenKind::Plus   => (BinaryOp::Add, 9),
                 TokenKind::Minus  => (BinaryOp::Sub, 9),
                 TokenKind::Star   => (BinaryOp::Mul, 10),
@@ -1035,7 +1193,17 @@ impl<'a> Parser<'a> {
             TokenKind::Identifier => {
                 let name = self.current().lexeme.clone();
                 self.bump();
-                Expr::Ident(name)
+                if name == "$signed" && self.match_kind(TokenKind::LParen) {
+                    let arg = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::RParen);
+                    Expr::Signed(Box::new(arg))
+                } else if name == "$clog2" && self.match_kind(TokenKind::LParen) {
+                    let arg = self.parse_expression(0);
+                    let _ = self.match_kind(TokenKind::RParen);
+                    Expr::Clog2(Box::new(arg))
+                } else {
+                    Expr::Ident(name)
+                }
             }
             TokenKind::Number => {
                 let lit = self.current().lexeme.clone();
@@ -1103,6 +1271,55 @@ impl<'a> Parser<'a> {
         }
         expr
     }
+}
+
+fn subst_expr_loop_var(e: Expr, loop_var: &str, k: i64) -> Expr {
+    match e {
+        Expr::Ident(s) if s == loop_var => Expr::Number(format!("{k}")),
+        Expr::Ident(s) => Expr::Ident(s),
+        Expr::Number(n) => Expr::Number(n),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op,
+            left: Box::new(subst_expr_loop_var(*left, loop_var, k)),
+            right: Box::new(subst_expr_loop_var(*right, loop_var, k)),
+        },
+        Expr::Unary { op, operand } => Expr::Unary {
+            op,
+            operand: Box::new(subst_expr_loop_var(*operand, loop_var, k)),
+        },
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr::Ternary {
+            cond: Box::new(subst_expr_loop_var(*cond, loop_var, k)),
+            then_expr: Box::new(subst_expr_loop_var(*then_expr, loop_var, k)),
+            else_expr: Box::new(subst_expr_loop_var(*else_expr, loop_var, k)),
+        },
+        Expr::Concat(exprs) => Expr::Concat(
+            exprs
+                .into_iter()
+                .map(|e| subst_expr_loop_var(e, loop_var, k))
+                .collect(),
+        ),
+        Expr::Index { base, msb, lsb } => Expr::Index {
+            base: Box::new(subst_expr_loop_var(*base, loop_var, k)),
+            msb: Box::new(subst_expr_loop_var(*msb, loop_var, k)),
+            lsb: lsb.map(|x| Box::new(subst_expr_loop_var(*x, loop_var, k))),
+        },
+        Expr::Clog2(a) => Expr::Clog2(Box::new(subst_expr_loop_var(*a, loop_var, k))),
+        Expr::Signed(a) => Expr::Signed(Box::new(subst_expr_loop_var(*a, loop_var, k))),
+    }
+}
+
+pub(crate) fn subst_port_connections(conns: &[PortConnection], loop_var: &str, k: i64) -> Vec<PortConnection> {
+    conns
+        .iter()
+        .map(|c| PortConnection {
+            port_name: c.port_name.clone(),
+            expr: subst_expr_loop_var(c.expr.clone(), loop_var, k),
+        })
+        .collect()
 }
 
 fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {

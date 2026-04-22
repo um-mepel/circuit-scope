@@ -32,6 +32,13 @@ pub enum TokenKind {
     Default,
     For,
     Integer,
+    /// `signed` (net type qualifier before vector dimensions).
+    Signed,
+    /// `generate` / `endgenerate` (generate regions).
+    Generate,
+    Endgenerate,
+    /// `genvar` (loop index in generate; statement skipped at CST level).
+    Genvar,
     // non-blocking assign
     NonBlockAssign, // <=  (contextually distinct from Le)
     // punctuation / single-char
@@ -68,6 +75,7 @@ pub enum TokenKind {
     // shifts
     Shl,     // <<
     Shr,     // >>
+    Ashr,    // >>>
     // logical
     LogAnd,  // &&
     LogOr,   // ||
@@ -189,6 +197,10 @@ impl<'a> Lexer<'a> {
                     "default" => TokenKind::Default,
                     "for" => TokenKind::For,
                     "integer" => TokenKind::Integer,
+                    "signed" => TokenKind::Signed,
+                    "generate" => TokenKind::Generate,
+                    "endgenerate" => TokenKind::Endgenerate,
+                    "genvar" => TokenKind::Genvar,
                     _ => TokenKind::Identifier,
                 };
                 tokens.push(Token {
@@ -325,7 +337,12 @@ impl<'a> Lexer<'a> {
                     '>' => {
                         if self.next_char() == Some('>') {
                             self.bump();
-                            TokenKind::Shr
+                            if self.next_char() == Some('>') {
+                                self.bump();
+                                TokenKind::Ashr
+                            } else {
+                                TokenKind::Shr
+                            }
                         } else if self.next_char() == Some('=') {
                             self.bump();
                             TokenKind::Ge

@@ -7,60 +7,9 @@ use crate::timescale_util::{
     unit_per_precision_ratio,
 };
 use crate::{
-    build_ir_for_file, find_top_module, generate_vcd, optimize_project, Diagnostic, IrProject,
+    build_ir_for_path_bufs, find_top_module, generate_vcd, optimize_project, Diagnostic, IrProject,
     SimConfig, VcdRunMeta, Severity,
 };
-
-// #region agent log
-fn agent_debug_ndjson(hypothesis_id: &str, location: &str, message: &str, data: &[(&str, String)]) {
-    use std::io::Write;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let esc = |s: &str| -> String {
-        let mut o = String::with_capacity(s.len() + 8);
-        for c in s.chars() {
-            match c {
-                '\\' => o.push_str("\\\\"),
-                '"' => o.push_str("\\\""),
-                '\n' => o.push_str("\\n"),
-                '\r' => o.push_str("\\r"),
-                c if c.is_control() => {
-                    use std::fmt::Write as _;
-                    let _ = write!(o, "\\u{:04x}", c as u32);
-                }
-                c => o.push(c),
-            }
-        }
-        o
-    };
-    let mut kv = String::new();
-    for (i, (k, v)) in data.iter().enumerate() {
-        if i > 0 {
-            kv.push(',');
-        }
-        kv.push('"');
-        kv.push_str(&esc(k));
-        kv.push_str("\":\"");
-        kv.push_str(&esc(v));
-        kv.push('"');
-    }
-    let line = format!(
-        "{{\"sessionId\":\"17b65d\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{{{}}},\"timestamp\":{}}}\n",
-        esc(hypothesis_id),
-        esc(location),
-        esc(message),
-        kv,
-        ts
-    );
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Users/mihirepel/Personal_Projects/verilog-compiler/.cursor/debug-17b65d.log")
-        .and_then(|mut f| f.write_all(line.as_bytes()));
-}
-// #endregion
 
 /// Overrides for VCD time base and how long the fixed-step kernel runs (`num_cycles` clock periods).
 #[derive(Debug, Clone, Default)]
@@ -233,18 +182,14 @@ pub fn run_csverilog_pipeline(
         return Err("no Verilog source files".into());
     }
 
-    let mut all_modules = Vec::new();
-    let mut all_diags = Vec::new();
-
     for file in verilog_paths.iter() {
         if !file.exists() {
             return Err(format!("file not found: {}", file.display()));
         }
-        let src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-        let ir = build_ir_for_file(file.to_string_lossy(), &src);
-        all_diags.extend(ir.diagnostics);
-        all_modules.extend(ir.modules);
     }
+
+    let mut project = build_ir_for_path_bufs(verilog_paths).map_err(|e| e.to_string())?;
+    let all_diags = std::mem::take(&mut project.diagnostics);
 
     let errors: Vec<&Diagnostic> = all_diags
         .iter()
@@ -259,14 +204,11 @@ pub fn run_csverilog_pipeline(
         return Err(msg.trim_end().to_string());
     }
 
-    if all_modules.is_empty() {
+    if project.modules.is_empty() {
         return Err("no modules found in input files".into());
     }
 
-    let mut project = IrProject {
-        modules: all_modules,
-        diagnostics: all_diags,
-    };
+    project.diagnostics = all_diags;
 
     let top_name = find_top_module(&project)?;
 
@@ -351,67 +293,7 @@ pub fn run_csverilog_pipeline(
         ..Default::default()
     };
 
-    // #region agent log
-    {
-        let first_basenames: String = verilog_paths
-            .iter()
-            .take(6)
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        agent_debug_ndjson(
-            "H1",
-            "csverilog_pipeline.rs:pre_generate_vcd",
-            "stale_binary_and_paths",
-            &[
-                ("verilog_core_version", crate::PACKAGE_VERSION.to_string()),
-                ("out_vcd_path", output_display.clone()),
-                ("command_line_meta", command_line_for_meta.to_string()),
-                ("verilog_paths_n", verilog_paths.len().to_string()),
-                ("first_source_basenames", first_basenames),
-            ],
-        );
-        agent_debug_ndjson(
-            "H3",
-            "csverilog_pipeline.rs:pre_generate_vcd",
-            "top_and_timescale",
-            &[
-                ("top_module", top_name.clone()),
-                ("time_unit", time_unit.clone()),
-                ("time_precision", time_precision.clone()),
-                ("delay_sum", delay_sum.to_string()),
-                ("k_ratio", k.to_string()),
-                ("h_fine", h_fine.to_string()),
-                ("num_cycles", num_cycles.to_string()),
-                ("clock_half_period", clock_half_period.to_string()),
-                ("clock_half_period_explicit", clock_half_period_explicit.to_string()),
-            ],
-        );
-    }
-    // #endregion
-
     let vcd = generate_vcd(&project, &config)?;
-
-    // #region agent log
-    {
-        let hex6_n = vcd.matches("HEX6").count();
-        let sim_line = vcd
-            .lines()
-            .find(|l| l.contains("simulation: num_cycles="))
-            .unwrap_or("")
-            .to_string();
-        agent_debug_ndjson(
-            "H2",
-            "csverilog_pipeline.rs:post_generate_vcd",
-            "artifact_shape",
-            &[
-                ("vcd_bytes", vcd.len().to_string()),
-                ("hex6_token_count", hex6_n.to_string()),
-                ("comment_sim_line", sim_line.chars().take(200).collect::<String>()),
-            ],
-        );
-    }
-    // #endregion
 
     Ok(vcd)
 }

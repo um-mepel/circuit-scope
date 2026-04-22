@@ -22,8 +22,8 @@ use std::fmt::Write as FmtWrite;
 
 use crate::delay_rational::DelayRational;
 use crate::ir::{
-    IrAlways, IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr, IrInitial, IrModule, IrProject,
-    IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
+    ir_try_eval_const_index_expr, IrAlways, IrAssign, IrBinOp, IrCaseArm, IrEdgeKind, IrExpr,
+    IrInitial, IrModule, IrProject, IrSensEntry, IrSensitivity, IrStmt, IrUnaryOp,
 };
 use crate::timescale_util::{
     clock_half_period_fine_ticks, timescale_token_to_fs, unit_per_precision_ratio,
@@ -217,6 +217,8 @@ struct Simulator<'a> {
     mem_elem_width: HashMap<String, usize>,
     scope_tree: ScopeNode,
     top: &'a IrModule,
+    /// Latest simulation time (femtoseconds) for debug instrumentation.
+    last_sim_time_fs: u128,
 }
 
 impl<'a> Simulator<'a> {
@@ -248,6 +250,7 @@ impl<'a> Simulator<'a> {
             &mut initial_blocks,
             &mut signal_order,
             &mut scope_tree,
+            false,
         );
 
         let (always_blocks, always_delay_procs) =
@@ -286,6 +289,7 @@ impl<'a> Simulator<'a> {
             mem_elem_width,
             scope_tree,
             top,
+            last_sim_time_fs: 0,
         }
     }
 
@@ -553,6 +557,10 @@ impl<'a> Simulator<'a> {
                 let name = format!("{}__{}", stem, k);
                 *signals.get(&name).unwrap_or(&0)
             }
+            IrExpr::Signed(inner) => {
+                let v = Self::static_eval(inner, signals, mem_bounds);
+                crate::arith::sign_extend_i64(v, 32)
+            }
         }
     }
 
@@ -566,10 +574,9 @@ impl<'a> Simulator<'a> {
                 let IrExpr::Ident(name) = value.as_ref() else {
                     return None;
                 };
-                let (IrExpr::Const(hi), IrExpr::Const(lo)) = (msb.as_ref(), lsb.as_ref()) else {
-                    return None;
-                };
-                let w_sel = (*hi - *lo).abs() as usize + 1;
+                let hi = ir_try_eval_const_index_expr(msb)?;
+                let lo = ir_try_eval_const_index_expr(lsb)?;
+                let w_sel = (hi - lo).abs() as usize + 1;
                 let w_full = widths.get(name).copied().unwrap_or(0);
                 if w_sel == w_full && w_full > 0 {
                     Some(name.clone())
@@ -581,17 +588,21 @@ impl<'a> Simulator<'a> {
         }
     }
 
-    fn flatten_module(
+    /// `assign vec = (vec & ~(1<<k)) | ((child & 1) << k)` — drives one bit of a packed vector from
+    /// a scalar child output when we cannot use `assign vec = child` (bit-select or partial slice).
+    /// Used for generated full-adders (`S[i]`, `c[i+1]`, …) so ripple adders are not silently dropped.
+    fn packed_scalar_into_vec_rhs(vec_name: &str, bit_k: i64, child: IrExpr, vec_width: usize) -> IrExpr {
+        crate::ir::ir_expr_merge_scalar_into_packed_vec(vec_name, bit_k, child, vec_width)
+    }
+
+    /// Registers hierarchical signals for `module` under `prefix` (ports, nets, memories).
+    fn register_module_signals_for_prefix(
         module: &IrModule,
         prefix: &str,
-        module_map: &HashMap<&str, &IrModule>,
         signals: &mut HashMap<String, i64>,
         widths: &mut HashMap<String, usize>,
         mem_bounds: &mut HashMap<String, (i64, i64)>,
         mem_elem_width: &mut HashMap<String, usize>,
-        assigns: &mut Vec<IrAssign>,
-        always_blocks: &mut Vec<IrAlways>,
-        initial_blocks: &mut Vec<IrInitial>,
         signal_order: &mut Vec<String>,
         scope: &mut ScopeNode,
     ) {
@@ -626,6 +637,44 @@ impl<'a> Simulator<'a> {
                 signal_order.push(full.clone());
                 scope.signals.push(full);
             }
+        }
+    }
+
+    /// `skip_register`: when true, ports/nets were already registered (inputs wired next).
+    fn flatten_module(
+        module: &IrModule,
+        prefix: &str,
+        module_map: &HashMap<&str, &IrModule>,
+        signals: &mut HashMap<String, i64>,
+        widths: &mut HashMap<String, usize>,
+        mem_bounds: &mut HashMap<String, (i64, i64)>,
+        mem_elem_width: &mut HashMap<String, usize>,
+        assigns: &mut Vec<IrAssign>,
+        always_blocks: &mut Vec<IrAlways>,
+        initial_blocks: &mut Vec<IrInitial>,
+        signal_order: &mut Vec<String>,
+        scope: &mut ScopeNode,
+        skip_register: bool,
+    ) {
+        let pfx = |name: &str| -> String {
+            if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}__{}", prefix, name)
+            }
+        };
+
+        if !skip_register {
+            Self::register_module_signals_for_prefix(
+                module,
+                prefix,
+                signals,
+                widths,
+                mem_bounds,
+                mem_elem_width,
+                signal_order,
+                scope,
+            );
         }
 
         for a in &module.assigns {
@@ -668,6 +717,35 @@ impl<'a> Simulator<'a> {
                     signals: Vec::new(),
                     children: Vec::new(),
                 };
+                Self::register_module_signals_for_prefix(
+                    child,
+                    &inst_prefix,
+                    signals,
+                    widths,
+                    mem_bounds,
+                    mem_elem_width,
+                    signal_order,
+                    &mut child_scope,
+                );
+
+                for conn in &inst.connections {
+                    let Some(pn) = conn.port_name.as_ref() else {
+                        continue;
+                    };
+                    let child_port = format!("{}__{}", inst_prefix, pn);
+                    let parent_expr = prefix_ir_expr(&conn.expr, prefix);
+                    let is_output = child
+                        .ports
+                        .iter()
+                        .any(|p| p.name == *pn && p.direction.as_deref() == Some("output"));
+                    if !is_output {
+                        assigns.push(IrAssign {
+                            lhs: child_port,
+                            rhs: parent_expr,
+                        });
+                    }
+                }
+
                 Self::flatten_module(
                     child,
                     &inst_prefix,
@@ -681,6 +759,7 @@ impl<'a> Simulator<'a> {
                     initial_blocks,
                     signal_order,
                     &mut child_scope,
+                    true,
                 );
                 scope.children.push(child_scope);
 
@@ -700,12 +779,30 @@ impl<'a> Simulator<'a> {
                                 lhs: parent_sig,
                                 rhs: IrExpr::Ident(child_port),
                             });
+                        } else if let IrExpr::PartSelect { value, msb, lsb } = &parent_expr {
+                            if let IrExpr::Ident(vec_name) = value.as_ref() {
+                                if let (Some(k_hi), Some(k_lo)) = (
+                                    ir_try_eval_const_index_expr(msb),
+                                    ir_try_eval_const_index_expr(lsb),
+                                ) {
+                                    if k_hi == k_lo {
+                                        let total_w = widths.get(vec_name).copied().unwrap_or(0);
+                                        if total_w > 0 && k_hi >= 0 && k_hi < total_w as i64 {
+                                            let rhs = Self::packed_scalar_into_vec_rhs(
+                                                vec_name,
+                                                k_hi,
+                                                IrExpr::Ident(child_port),
+                                                total_w,
+                                            );
+                                            assigns.push(IrAssign {
+                                                lhs: vec_name.clone(),
+                                                rhs,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        assigns.push(IrAssign {
-                            lhs: child_port,
-                            rhs: parent_expr,
-                        });
                     }
                 }
             }
@@ -806,6 +903,7 @@ impl<'a> Simulator<'a> {
                 break;
             }
             t_sim = next_t;
+            self.last_sim_time_fs = t_sim;
 
             self.prev_signals = self.signals.clone();
 
@@ -886,40 +984,90 @@ impl<'a> Simulator<'a> {
         }
     }
 
+    /// `true` for `always @(posedge …)` / `negedge` (including lists mixing clock + level).
+    fn sensitivity_has_clock_edge(sens: &IrSensitivity) -> bool {
+        match sens {
+            IrSensitivity::Star => false,
+            IrSensitivity::EdgeList(edges) => edges
+                .iter()
+                .any(|e| matches!(e.edge, IrEdgeKind::Posedge | IrEdgeKind::Negedge)),
+        }
+    }
+
+    fn always_block_should_fire(&self, ab: &IrAlways, stabilize_level_comb: bool) -> bool {
+        match &ab.sensitivity {
+            IrSensitivity::Star => true,
+            IrSensitivity::EdgeList(edges) => {
+                if stabilize_level_comb && Self::edge_list_is_pure_combinational(edges) {
+                    true
+                } else {
+                    edges.iter().any(|e| {
+                        let cur = *self.signals.get(&e.signal).unwrap_or(&0);
+                        let prev = *self.prev_signals.get(&e.signal).unwrap_or(&0);
+                        match e.edge {
+                            IrEdgeKind::Posedge => prev == 0 && cur == 1,
+                            IrEdgeKind::Negedge => prev == 1 && cur == 0,
+                            IrEdgeKind::Level => cur != prev,
+                        }
+                    })
+                }
+            }
+        }
+    }
+
     /// `stabilize_level_comb`: used only when converging before `#0` dumpvars. Verilog
     /// `always @(a or b)` lowers to an edge list of **level** sensitivities; at t=0 we have
     /// `prev == cur` everywhere, so `cur != prev` never holds and the block would never run — same
     /// X-on-dump bug as missing `always @*`. Pure level lists must execute once during startup.
+    ///
+    /// **Two-pass scheduling:** blocks with **posedge/negedge** run first; their NBAs commit, then
+    /// `assign` propagates, then `always @*` / purely level-sensitive blocks run. This matches
+    /// coursework FSMs where `always @(posedge clk) X <= X_Next` must see `X_Next` from the
+    /// *previous* cycle while `always @* case (X)` recomputes `X_Next` from the **updated** `X`.
     fn fire_always_blocks(&mut self, stabilize_level_comb: bool) {
         let blocks = self.always_blocks.clone();
-        let mut scratch = self.signals.clone();
-        let mut nba_all: Vec<(String, i64)> = Vec::new();
 
+        // Pass 1 — clocked sequential (`posedge` / `negedge`, possibly mixed with level in the list).
+        //
+        // **Per-process scratch:** IEEE NBAs sample RHS from the register/wire state *before any*
+        // NBA from this timestep updates a variable. A single shared `scratch` across *different*
+        // `always @(posedge …)` blocks is wrong if an earlier process used **blocking** assigns or
+        // otherwise perturbed `scratch`: a later FSM + datapath pair can then see a bogus `X`/`A`
+        // (EECS270 Project 7: `Result` cleared when entering `XDisp` after `XA_DN`).
+        let mut scratch = self.signals.clone();
+        let mut nba = Vec::new();
         for ab in &blocks {
-            let should_fire = match &ab.sensitivity {
-                IrSensitivity::Star => true,
-                IrSensitivity::EdgeList(edges) => {
-                    if stabilize_level_comb && Self::edge_list_is_pure_combinational(edges) {
-                        true
-                    } else {
-                        edges.iter().any(|e| {
-                            let cur = *self.signals.get(&e.signal).unwrap_or(&0);
-                            let prev = *self.prev_signals.get(&e.signal).unwrap_or(&0);
-                            match e.edge {
-                                IrEdgeKind::Posedge => prev == 0 && cur == 1,
-                                IrEdgeKind::Negedge => prev == 1 && cur == 0,
-                                IrEdgeKind::Level => cur != prev,
-                            }
-                        })
-                    }
-                }
-            };
-            if should_fire {
-                self.exec_stmts_on_env(&ab.stmts, &mut scratch, &mut nba_all);
+            if !Self::sensitivity_has_clock_edge(&ab.sensitivity) {
+                continue;
+            }
+            if self.always_block_should_fire(ab, stabilize_level_comb) {
+                scratch.clone_from(&self.signals);
+                self.exec_stmts_on_env(&ab.stmts, &mut scratch, &mut nba);
             }
         }
 
-        for (lhs, val) in nba_all {
+        for (lhs, val) in nba {
+            let w = self.width_for_signal(&lhs);
+            scratch.insert(lhs.clone(), mask_to_width(val, w));
+            self.driven.insert(lhs);
+        }
+        self.signals = scratch;
+
+        // `assign` often depends on state regs updated above (e.g. `LD_A = (X==…)`).
+        self.eval_combinational();
+
+        // Pass 2 — `always @*` and purely level-sensitive `@(a or b …)`.
+        let mut scratch = self.signals.clone();
+        let mut nba = Vec::new();
+        for ab in &blocks {
+            if Self::sensitivity_has_clock_edge(&ab.sensitivity) {
+                continue;
+            }
+            if self.always_block_should_fire(ab, stabilize_level_comb) {
+                self.exec_stmts_on_env(&ab.stmts, &mut scratch, &mut nba);
+            }
+        }
+        for (lhs, val) in nba {
             let w = self.width_for_signal(&lhs);
             scratch.insert(lhs.clone(), mask_to_width(val, w));
             self.driven.insert(lhs);
@@ -1125,6 +1273,16 @@ impl<'a> Simulator<'a> {
         match expr {
             IrExpr::Const(v) => *v,
             IrExpr::Ident(name) => *env.get(name).unwrap_or(&0),
+            IrExpr::Binary {
+                op: IrBinOp::Ashr,
+                left,
+                right,
+            } => {
+                let w = self.infer_expr_width(left).max(1).min(63);
+                let l = self.eval_expr_with_env(left, env);
+                let r = self.eval_expr_with_env(right, env);
+                crate::arith::arith_shr_i64(l, r as u32, w)
+            }
             IrExpr::Binary { op, left, right } => {
                 let l = self.eval_expr_with_env(left, env);
                 let r = self.eval_expr_with_env(right, env);
@@ -1168,6 +1326,11 @@ impl<'a> Simulator<'a> {
                 let v = *env.get(&name).unwrap_or(&0);
                 mask_to_width(v, ew)
             }
+            IrExpr::Signed(inner) => {
+                let w = self.infer_expr_width(inner).max(1).min(63);
+                let v = self.eval_expr_with_env(inner, env);
+                crate::arith::sign_extend_i64(v, w)
+            }
         }
     }
 
@@ -1196,6 +1359,7 @@ impl<'a> Simulator<'a> {
             IrExpr::Ternary { then_expr, else_expr, .. } => {
                 self.infer_expr_width(then_expr).max(self.infer_expr_width(else_expr))
             }
+            IrExpr::Signed(inner) => self.infer_expr_width(inner),
         }
     }
 
@@ -1467,6 +1631,9 @@ fn eval_binop(op: IrBinOp, l: i64, r: i64) -> i64 {
         IrBinOp::Xor => l ^ r,
         IrBinOp::Shl => l.wrapping_shl(r as u32),
         IrBinOp::Shr => ((l as u64).wrapping_shr(r as u32)) as i64,
+        IrBinOp::Ashr => {
+            unreachable!("IrBinOp::Ashr must be evaluated in eval_expr_with_env with operand width")
+        }
         IrBinOp::LogAnd => i64::from(l != 0 && r != 0),
         IrBinOp::LogOr => i64::from(l != 0 || r != 0),
         IrBinOp::Eq => i64::from(l == r),
@@ -1574,6 +1741,7 @@ fn prefix_ir_expr(expr: &IrExpr, prefix: &str) -> IrExpr {
             },
             index: Box::new(prefix_ir_expr(index, prefix)),
         },
+        IrExpr::Signed(inner) => IrExpr::Signed(Box::new(prefix_ir_expr(inner, prefix))),
     }
 }
 
@@ -1692,6 +1860,7 @@ mod tests {
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1806,6 +1975,7 @@ endmodule
                 ],
             }],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
 
         let proj = make_project(vec![top]);
@@ -1853,6 +2023,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1889,6 +2060,7 @@ endmodule
                 ],
             }],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1917,6 +2089,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -1949,6 +2122,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let top = IrModule {
             name: "top".into(),
@@ -1958,6 +2132,7 @@ endmodule
             assigns: vec![],
             instances: vec![IrInstance {
                 module_name: "inverter".into(),
+                parameter_assignments: vec![],
                 instance_name: "u1".into(),
                 connections: vec![
                     IrPortConn {
@@ -1973,6 +2148,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top, child]);
         let config = SimConfig {
@@ -1999,6 +2175,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2023,6 +2200,7 @@ endmodule
             always_blocks: vec![],
             initial_blocks: vec![],
             mem_arrays: vec![],
+            resolved_parameters: std::collections::HashMap::new(),
         };
         let proj = make_project(vec![top]);
         let config = SimConfig {
@@ -2080,7 +2258,9 @@ endmodule
                 always_blocks: vec![],
                 initial_blocks: vec![],
                 mem_arrays: vec![],
+                resolved_parameters: std::collections::HashMap::new(),
             },
+            last_sim_time_fs: 0,
         };
         assert_eq!(
             sim.eval_expr(&IrExpr::Binary {
