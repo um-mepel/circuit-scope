@@ -4,7 +4,7 @@ version = "0.2.2"
 edition = "2021"
 description = "Circuit Scope — Verilog (IEEE 1364) editor, simulator, and VCD viewer."
 license = "MIT"
-repository = "https://github.com/um-mepel/circuit-scope"
+repository = "https://github.com/um-mepel/circuit-scope-verilog"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -4,7 +4,7 @@ version = "0.2.2"
 edition = "2021"
 description = "IEEE 1364 Verilog parse, optimize, and VCD simulation for Circuit Scope (not SystemVerilog)."
 license = "MIT"
-repository = "https://github.com/um-mepel/circuit-scope"
+repository = "https://github.com/um-mepel/circuit-scope-verilog"
 readme = "../../README.md"
 
 [[bin]]

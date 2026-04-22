@@ -40,12 +40,12 @@ Each time you publish a new tagged release (e.g. `v0.2.3`):
    version=0.2.3
    for arch in aarch64 x64; do
      curl -L -o "cs-${arch}.dmg" \
-       "https://github.com/um-mepel/circuit-scope/releases/download/v${version}/Circuit%20Scope_${version}_${arch}.dmg"
+       "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v${version}/Circuit%20Scope_${version}_${arch}.dmg"
      shasum -a 256 "cs-${arch}.dmg"
    done
 
    curl -L -o "source.tar.gz" \
-     "https://github.com/um-mepel/circuit-scope/archive/refs/tags/v${version}.tar.gz"
+     "https://github.com/um-mepel/circuit-scope-verilog/archive/refs/tags/v${version}.tar.gz"
    shasum -a 256 source.tar.gz
    ```
 

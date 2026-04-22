@@ -1,12 +1,12 @@
 class Csverilog < Formula
   desc "IEEE 1364 Verilog parser, optimizer, and VCD simulator (Circuit Scope CLI)"
-  homepage "https://github.com/um-mepel/circuit-scope"
-  url "https://github.com/um-mepel/circuit-scope/archive/refs/tags/v0.2.2.tar.gz"
+  homepage "https://github.com/um-mepel/circuit-scope-verilog"
+  url "https://github.com/um-mepel/circuit-scope-verilog/archive/refs/tags/v0.2.2.tar.gz"
   # Regenerate after each release with:
-  #   curl -L https://github.com/um-mepel/circuit-scope/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+  #   curl -L https://github.com/um-mepel/circuit-scope-verilog/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
-  head "https://github.com/um-mepel/circuit-scope.git", branch: "main"
+  head "https://github.com/um-mepel/circuit-scope-verilog.git", branch: "main"
 
   depends_on "rust" => :build
 

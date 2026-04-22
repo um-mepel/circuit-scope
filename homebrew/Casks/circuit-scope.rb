@@ -9,18 +9,18 @@ cask "circuit-scope" do
   # GitHub serves that asset URL with the space percent-encoded as %20.
   on_arm do
     sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    url "https://github.com/um-mepel/circuit-scope/releases/download/v#{version}/Circuit%20Scope_#{version}_aarch64.dmg",
-        verified: "github.com/um-mepel/circuit-scope/"
+    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit%20Scope_#{version}_aarch64.dmg",
+        verified: "github.com/um-mepel/circuit-scope-verilog/"
   end
   on_intel do
     sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-    url "https://github.com/um-mepel/circuit-scope/releases/download/v#{version}/Circuit%20Scope_#{version}_x64.dmg",
-        verified: "github.com/um-mepel/circuit-scope/"
+    url "https://github.com/um-mepel/circuit-scope-verilog/releases/download/v#{version}/Circuit%20Scope_#{version}_x64.dmg",
+        verified: "github.com/um-mepel/circuit-scope-verilog/"
   end
 
   name "Circuit Scope"
   desc "Verilog (IEEE 1364) IDE: edit, simulate to VCD, waveform viewer"
-  homepage "https://github.com/um-mepel/circuit-scope"
+  homepage "https://github.com/um-mepel/circuit-scope-verilog"
 
   livecheck do
     url :url

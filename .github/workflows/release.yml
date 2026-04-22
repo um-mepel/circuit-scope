@@ -55,21 +55,15 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build Circuit Scope (Tauri bundle)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Circuit Scope ${{ github.ref_name }}"
-          releaseBody: |
-            Automated build of Circuit Scope ${{ github.ref_name }}.
+      - name: Build frontend (Vite)
+        run: npm run build
 
-            macOS bundles are attached as `.dmg` (per architecture) and `.app.tar.gz`.
-            The standalone `csverilog` CLI binary is also attached for each architecture.
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.rust-target }}
+      - name: Build Tauri bundle
+        env:
+          # Ensure Tauri's CLI runs non-interactively on GitHub runners.
+          CI: "true"
+        run: |
+          npx --no-install tauri build --target ${{ matrix.rust-target }}
 
       - name: Build csverilog CLI
         run: |
@@ -80,26 +74,57 @@ jobs:
             --locked \
             --target ${{ matrix.rust-target }}
 
-      - name: Package csverilog binary
-        id: package-cli
+      - name: Stage release assets
+        id: stage
         run: |
           set -euo pipefail
-          bin="src-tauri/verilog-core/target/${{ matrix.rust-target }}/release/csverilog"
-          if [ ! -x "$bin" ]; then
-            bin="src-tauri/target/${{ matrix.rust-target }}/release/csverilog"
-          fi
           version="${GITHUB_REF_NAME#v}"
-          out="csverilog-${version}-${{ matrix.rust-target }}.tar.gz"
-          tar -C "$(dirname "$bin")" -czf "$out" "$(basename "$bin")"
-          shasum -a 256 "$out" | tee "$out.sha256"
-          echo "asset=$out" >> "$GITHUB_OUTPUT"
-          echo "sha=$out.sha256" >> "$GITHUB_OUTPUT"
+          staging="${RUNNER_TEMP}/release-${{ matrix.rust-target }}"
+          mkdir -p "$staging"
 
-      - name: Upload csverilog binary to the Release
+          bundle_root="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          if [ ! -d "$bundle_root" ]; then
+            echo "error: no Tauri bundle at $bundle_root" >&2
+            ls -la "src-tauri/target/${{ matrix.rust-target }}/release" || true
+            exit 1
+          fi
+
+          # DMG(s)
+          while IFS= read -r -d '' dmg; do
+            cp "$dmg" "$staging/"
+          done < <(find "$bundle_root/dmg" -maxdepth 1 -type f -name "*.dmg" -print0)
+
+          # App bundle as tar.gz (portable alternative to the DMG)
+          if [ -d "$bundle_root/macos" ]; then
+            while IFS= read -r -d '' app; do
+              app_base="$(basename "$app")"
+              tar -C "$bundle_root/macos" -czf "$staging/${app_base%.app}_${version}_${{ matrix.rust-target }}.app.tar.gz" "$app_base"
+            done < <(find "$bundle_root/macos" -maxdepth 1 -type d -name "*.app" -print0)
+          fi
+
+          # csverilog binary
+          cli="src-tauri/verilog-core/target/${{ matrix.rust-target }}/release/csverilog"
+          if [ ! -x "$cli" ]; then
+            cli="src-tauri/target/${{ matrix.rust-target }}/release/csverilog"
+          fi
+          cli_asset="csverilog-${version}-${{ matrix.rust-target }}.tar.gz"
+          tar -C "$(dirname "$cli")" -czf "$staging/$cli_asset" "$(basename "$cli")"
+          ( cd "$staging" && shasum -a 256 "$cli_asset" > "$cli_asset.sha256" )
+
+          ls -la "$staging"
+          echo "dir=$staging" >> "$GITHUB_OUTPUT"
+
+      - name: Publish draft Release with assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          name: "Circuit Scope ${{ github.ref_name }}"
           draft: true
+          prerelease: false
+          body: |
+            Automated build of Circuit Scope ${{ github.ref_name }}.
+
+            macOS bundles are attached as `.dmg` (per architecture) and `.app.tar.gz`.
+            The standalone `csverilog` CLI binary is also attached for each architecture.
           files: |
-            ${{ steps.package-cli.outputs.asset }}
-            ${{ steps.package-cli.outputs.sha }}
+            ${{ steps.stage.outputs.dir }}/*
