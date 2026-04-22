@@ -57,3 +57,35 @@ Build the standalone Verilog CLI:
 ```bash
 npm run build-csverilog
 ```
+
+## License
+
+Circuit Scope and the `csverilog` CLI are released under the [MIT License](LICENSE).
+
+## Releases
+
+Versions are kept in lockstep across four files:
+
+- [package.json](package.json)
+- [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json)
+- [src-tauri/Cargo.toml](src-tauri/Cargo.toml)
+- [src-tauri/verilog-core/Cargo.toml](src-tauri/verilog-core/Cargo.toml)
+
+After bumping the four files, tag the commit with `vX.Y.Z` and push the tag:
+
+```bash
+git tag v0.2.2
+git push origin v0.2.2
+```
+
+Pushing a `v*` tag triggers [.github/workflows/release.yml](.github/workflows/release.yml), which builds the macOS `.dmg` / `.app` on Intel and Apple Silicon plus a `csverilog` binary, and attaches them to the matching GitHub Release.
+
+## Homebrew
+
+Circuit Scope can be installed on macOS via a custom Homebrew tap that ships a cask for the app and a formula for the `csverilog` CLI. See [homebrew/README.md](homebrew/README.md) for tap setup, audit/test steps, and the bump workflow.
+
+```bash
+brew tap um-mepel/circuit-scope https://github.com/um-mepel/homebrew-circuit-scope
+brew install --cask circuit-scope
+brew install csverilog
+```

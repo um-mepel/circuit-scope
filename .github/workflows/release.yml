@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)build (e.g. v0.2.2). Leave empty to use current ref."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-tauri:
+    name: Build Circuit Scope (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-apple-silicon
+            os: macos-14
+            rust-target: aarch64-apple-darwin
+          - label: macos-intel
+            os: macos-13
+            rust-target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+            src-tauri/verilog-core
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Circuit Scope (Tauri bundle)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Circuit Scope ${{ github.ref_name }}"
+          releaseBody: |
+            Automated build of Circuit Scope ${{ github.ref_name }}.
+
+            macOS bundles are attached as `.dmg` (per architecture) and `.app.tar.gz`.
+            The standalone `csverilog` CLI binary is also attached for each architecture.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.rust-target }}
+
+      - name: Build csverilog CLI
+        run: |
+          cargo build \
+            --manifest-path src-tauri/verilog-core/Cargo.toml \
+            --bin csverilog \
+            --release \
+            --locked \
+            --target ${{ matrix.rust-target }}
+
+      - name: Package csverilog binary
+        id: package-cli
+        run: |
+          set -euo pipefail
+          bin="src-tauri/verilog-core/target/${{ matrix.rust-target }}/release/csverilog"
+          if [ ! -x "$bin" ]; then
+            bin="src-tauri/target/${{ matrix.rust-target }}/release/csverilog"
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          out="csverilog-${version}-${{ matrix.rust-target }}.tar.gz"
+          tar -C "$(dirname "$bin")" -czf "$out" "$(basename "$bin")"
+          shasum -a 256 "$out" | tee "$out.sha256"
+          echo "asset=$out" >> "$GITHUB_OUTPUT"
+          echo "sha=$out.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload csverilog binary to the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: |
+            ${{ steps.package-cli.outputs.asset }}
+            ${{ steps.package-cli.outputs.sha }}
